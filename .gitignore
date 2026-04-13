@@ -2,3 +2,5 @@ bin/
 obj/
 *.user
 .vs/
+# Script error logs (generated at runtime next to .cs files)
+Scripts/*.log

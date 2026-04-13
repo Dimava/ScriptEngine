@@ -157,14 +157,21 @@ namespace ScriptEngine
             using var ms = new MemoryStream();
             var result = compilation.Emit(ms);
 
+            var logPath = Path.ChangeExtension(path, ".log");
+
             if (!result.Success)
             {
                 var errors = result.Diagnostics
                     .Where(d => d.Severity == DiagnosticSeverity.Error)
-                    .Select(d => $"  {d.GetMessage()} ({d.Location.GetLineSpan().StartLinePosition})");
-                MelonLogger.Error($"[ScriptEngine] Compile errors in {Path.GetFileName(path)}:\n{string.Join("\n", errors)}");
+                    .Select(d => $"{d.GetMessage()} ({d.Location.GetLineSpan().StartLinePosition})");
+                var errorText = string.Join("\n", errors);
+                MelonLogger.Error($"[ScriptEngine] Compile errors in {Path.GetFileName(path)}:\n  {errorText.Replace("\n", "\n  ")}");
+                File.WriteAllText(logPath, $"Compile errors in {Path.GetFileName(path)}:\n{errorText}\n");
                 return null;
             }
+
+            // Clear stale log on success
+            if (File.Exists(logPath)) File.Delete(logPath);
 
             ms.Seek(0, SeekOrigin.Begin);
             return Assembly.Load(ms.ToArray());
