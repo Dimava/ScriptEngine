@@ -119,6 +119,17 @@ static class SomeClass_SomeMethod_Patch
 
 Calling `_h.UnpatchSelf()` at the start of `OnLoad` ensures patches don't stack up on hot-reload.
 
+## Exploring game code
+
+Roslyn compiles against the game's `.dll` files directly — you never need source. But to know what types and methods exist, decompile the game assembly first:
+
+```bash
+# requires: dotnet tool install -g ilspycmd
+ilspycmd "<GameDir>/<Game>_Data/Managed/Assembly-CSharp.dll" -p -o Decompiled/
+```
+
+This produces one `.cs` file per class in `Decompiled/`. Browse them to find types and method names, then reference them in your scripts. Compile errors like `does not contain a definition for 'X'` mean you got a name wrong — check the decompiled file.
+
 ## Building
 
 Requires .NET SDK 6+.
