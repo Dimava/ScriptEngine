@@ -4,6 +4,8 @@ A universal MelonLoader mod that hot-reloads C# scripts at runtime — no game r
 
 Drop a `.cs` file into the `Scripts/` folder, save it, and it compiles and runs within 300ms.
 
+On first launch, ScriptEngine creates `Scripts/HelloWorld.cs` automatically if the folder has no scripts yet. The sample includes a persistent `GameObject` with an `Update()` loop and a minimal Harmony patch.
+
 ## How it works
 
 ScriptEngine uses [Roslyn](https://github.com/dotnet/roslyn) to compile `.cs` files in-process. Every loaded assembly in the current MelonLoader game is automatically available as a reference, and ScriptEngine also scans the game's managed DLL directory for anything not yet loaded.

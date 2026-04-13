@@ -18,6 +18,75 @@ namespace ScriptEngine
     {
         static string ScriptsDir = null!;
         static string GameDir = null!;
+        const string StarterScriptName = "HelloWorld.cs";
+        const string StarterScriptContents =
+@"using HarmonyLib;
+using MelonLoader;
+using UnityEngine;
+
+public static class HelloWorld
+{
+    static readonly Harmony Harmony = new(""scriptengine.helloworld"");
+    static GameObject? _gameObject;
+
+    public static void OnLoad()
+    {
+        MelonLogger.Msg(""Hello from ScriptEngine!"");
+
+        if (_gameObject != null)
+            GameObject.Destroy(_gameObject);
+
+        _gameObject = new GameObject(""__ScriptEngineHelloWorld__"");
+        GameObject.DontDestroyOnLoad(_gameObject);
+        _gameObject.AddComponent<HelloWorldBehaviour>();
+
+        Harmony.UnpatchSelf();
+        Harmony.PatchAll(typeof(HelloWorld).Assembly);
+        DemoTarget.Ping();
+    }
+
+    public static void OnUnload()
+    {
+        Harmony.UnpatchSelf();
+
+        if (_gameObject != null)
+        {
+            GameObject.Destroy(_gameObject);
+            _gameObject = null;
+        }
+    }
+}
+
+public sealed class HelloWorldBehaviour : MonoBehaviour
+{
+    float _nextLogTime;
+
+    void Update()
+    {
+        if (Time.unscaledTime < _nextLogTime)
+            return;
+
+        _nextLogTime = Time.unscaledTime + 5f;
+        MelonLogger.Msg(""HelloWorldBehaviour.Update()"");
+    }
+}
+
+public static class DemoTarget
+{
+    public static void Ping()
+    {
+        MelonLogger.Msg(""DemoTarget.Ping()"");
+    }
+}
+
+[HarmonyPatch(typeof(DemoTarget), nameof(DemoTarget.Ping))]
+public static class DemoTargetPingPatch
+{
+    static void Prefix()
+    {
+        MelonLogger.Msg(""Harmony prefix before DemoTarget.Ping()"");
+    }
+}";
 
         // track loaded scripts: file path -> (assembly, onUnload action)
         static readonly Dictionary<string, LoadedScript> _loaded = new();
@@ -28,6 +97,7 @@ namespace ScriptEngine
             GameDir = MelonEnvironment.GameRootDirectory;
             ScriptsDir = Path.Combine(GameDir, "Scripts");
             Directory.CreateDirectory(ScriptsDir);
+            EnsureStarterScript();
 
             LoggerInstance.Msg($"ScriptEngine watching: {ScriptsDir}");
 
@@ -45,6 +115,18 @@ namespace ScriptEngine
             _watcher.Created += OnFileEvent;
             _watcher.Deleted += OnFileDeleted;
             _watcher.Renamed += OnFileRenamed;
+        }
+
+        static void EnsureStarterScript()
+        {
+            if (Directory.GetFiles(ScriptsDir, "*.cs", SearchOption.TopDirectoryOnly).Length != 0)
+                return;
+
+            var starterScriptPath = Path.Combine(ScriptsDir, StarterScriptName);
+            if (File.Exists(starterScriptPath))
+                return;
+
+            File.WriteAllText(starterScriptPath, StarterScriptContents);
         }
 
         // Debounce: FSW fires multiple events per save
