@@ -1,12 +1,12 @@
 # ScriptEngine
 
-A MelonLoader mod for **Modulus** that hot-reloads C# scripts at runtime — no game restart needed.
+A universal MelonLoader mod that hot-reloads C# scripts at runtime — no game restart needed.
 
 Drop a `.cs` file into the `Scripts/` folder, save it, and it compiles and runs within 300ms.
 
 ## How it works
 
-ScriptEngine uses [Roslyn](https://github.com/dotnet/roslyn) to compile `.cs` files in-process. Every loaded assembly in the game (Unity engine, MelonLoader, game code, everything) is automatically available as a reference — you don't need a project file or build step.
+ScriptEngine uses [Roslyn](https://github.com/dotnet/roslyn) to compile `.cs` files in-process. Every loaded assembly in the current MelonLoader game is automatically available as a reference, and ScriptEngine also scans the game's managed DLL directory for anything not yet loaded.
 
 On save:
 1. `FileSystemWatcher` detects the change (debounced 300ms)
@@ -15,6 +15,10 @@ On save:
 4. New assembly is loaded and `OnLoad()` is called
 
 ## Installation
+
+Download the latest release zip and extract it into the target MelonLoader game's directory.
+
+The release archive contains this layout:
 
 ```
 Mods/ScriptEngine.dll
@@ -30,7 +34,7 @@ UserLibs/System.Text.Encoding.CodePages.dll
 UserLibs/System.Threading.Tasks.Extensions.dll
 ```
 
-All files are produced by `dotnet build -c Release` and copied by the deploy step.
+If you are building from source, package the release files with `.\scripts\package-release.ps1`.
 
 ## Writing scripts
 
@@ -125,21 +129,35 @@ Roslyn compiles against the game's `.dll` files directly — you never need sour
 
 ```bash
 # requires: dotnet tool install -g ilspycmd
-ilspycmd "<GameDir>/<Game>_Data/Managed/Assembly-CSharp.dll" -p -o Decompiled/
+.\scripts\decompile-game.ps1 -GamePath "C:\Path\To\Your\MelonLoaderGame"
 ```
 
-This produces one `.cs` file per class in `Decompiled/`. Browse them to find types and method names, then reference them in your scripts. Compile errors like `does not contain a definition for 'X'` mean you got a name wrong — check the decompiled file.
+By default this writes one `.cs` file per class into `<GameDir>\Decompiled\`. Browse them to find types and method names, then reference them in your scripts. Compile errors like `does not contain a definition for 'X'` mean you got a name wrong — check the decompiled file.
 
 ## Building
 
 Requires .NET SDK 6+.
 
-```bash
-cd ScriptEngine
-dotnet build -c Release
+ScriptEngine resolves MelonLoader from the official NuGet package at build time.
+
+```powershell
+dotnet restore .\ScriptEngine\ScriptEngine.csproj
+dotnet build .\ScriptEngine\ScriptEngine.csproj -c Release
 ```
 
-Then copy `bin/Release/netstandard2.0/ScriptEngine.dll` to `Mods/` and the remaining DLLs to `UserLibs/`.
+To restore, build, and create a release zip in one step:
+
+```powershell
+.\scripts\package-release.ps1 -Version 1.0.0
+```
+
+This creates `release/ScriptEngine-1.0.0.zip`, ready for GitHub Releases or Nexus Mods.
+
+For local development, you can hard-link the current build output into the game's `Mods/` and `UserLibs/` directories:
+
+```powershell
+.\scripts\link-dev-build.ps1 -GamePath "C:\Path\To\Your\MelonLoaderGame"
+```
 
 ## Project layout
 

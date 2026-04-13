@@ -5,11 +5,11 @@ using System.Linq;
 using System.Reflection;
 using System.Threading;
 using MelonLoader;
+using MelonLoader.Utils;
 using Microsoft.CodeAnalysis;
-using UnityEngine;
 using Microsoft.CodeAnalysis.CSharp;
 
-[assembly: MelonInfo(typeof(ScriptEngine.ScriptEngineMod), "ScriptEngine", "1.0.0", "local")]
+[assembly: MelonInfo(typeof(ScriptEngine.ScriptEngineMod), "ScriptEngine", "1.0.0", "Dimava")]
 [assembly: MelonGame()]
 
 namespace ScriptEngine
@@ -25,7 +25,7 @@ namespace ScriptEngine
 
         public override void OnInitializeMelon()
         {
-            GameDir = Path.GetDirectoryName(System.Diagnostics.Process.GetCurrentProcess().MainModule!.FileName)!;
+            GameDir = MelonEnvironment.GameRootDirectory;
             ScriptsDir = Path.Combine(GameDir, "Scripts");
             Directory.CreateDirectory(ScriptsDir);
 
@@ -126,7 +126,7 @@ namespace ScriptEngine
             }
 
             // Also add everything in Managed/ that isn't already loaded
-            var managedDir = Path.Combine(Application.dataPath, "Managed");
+            var managedDir = MelonEnvironment.UnityGameManagedDirectory;
             if (Directory.Exists(managedDir))
             {
                 var loadedPaths = new HashSet<string>(

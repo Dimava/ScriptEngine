@@ -1,5 +1,6 @@
 bin/
 obj/
+release/
 *.user
 .vs/
 # Script error logs (generated at runtime next to .cs files)
