@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Threading;
 using MelonLoader;
 using Microsoft.CodeAnalysis;
+using UnityEngine;
 using Microsoft.CodeAnalysis.CSharp;
 
 [assembly: MelonInfo(typeof(ScriptEngine.ScriptEngineMod), "ScriptEngine", "1.0.0", "local")]
@@ -125,7 +126,7 @@ namespace ScriptEngine
             }
 
             // Also add everything in Managed/ that isn't already loaded
-            var managedDir = Path.Combine(GameDir, "Modulus_Data", "Managed");
+            var managedDir = Path.Combine(Application.dataPath, "Managed");
             if (Directory.Exists(managedDir))
             {
                 var loadedPaths = new HashSet<string>(
