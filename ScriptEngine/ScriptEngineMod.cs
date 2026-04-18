@@ -98,9 +98,33 @@ public static class DemoTargetPingPatch
         static readonly Regex ScriptSectionRegex = new(@"^\[scripts\.""((?:\\.|[^""])*)""\]\s*$", RegexOptions.Compiled);
         static readonly Dictionary<string, Timer> _debounce = new(StringComparer.OrdinalIgnoreCase);
         static Timer? _configDebounce;
+        static DateTime _ignoreConfigEventsUntilUtc = DateTime.MinValue;
+        static bool _showUi;
+        static object? _windowRect;
+        static object? _scrollPosition;
         static FileSystemWatcher _watcher = null!;
         static FileSystemWatcher _configWatcher = null!;
         static ScriptEngineConfig _config = new();
+
+        public override void OnUpdate()
+        {
+            if (RuntimeGui.GetKeyDown("F8"))
+                _showUi = !_showUi;
+        }
+
+        public override void OnGUI()
+        {
+            if (!_showUi)
+                return;
+
+            if (!RuntimeGui.IsAvailable)
+                return;
+
+            _windowRect ??= RuntimeGui.CreateRect(40f, 40f, 560f, 640f);
+            _scrollPosition ??= RuntimeGui.CreateVector2(0f, 0f);
+            RuntimeGui.SetDepth(0);
+            _windowRect = RuntimeGui.Window(0x51C12E, _windowRect, DrawWindow, "ScriptEngine");
+        }
 
         public override void OnInitializeMelon()
         {
@@ -179,6 +203,9 @@ public static class DemoTargetPingPatch
             if (!IsConfigPath(e.FullPath))
                 return;
 
+            if (ShouldIgnoreConfigEvent())
+                return;
+
             DebounceConfigReload();
         }
 
@@ -187,8 +214,14 @@ public static class DemoTargetPingPatch
             if (!IsConfigPath(e.OldFullPath) && !IsConfigPath(e.FullPath))
                 return;
 
+            if (ShouldIgnoreConfigEvent())
+                return;
+
             DebounceConfigReload();
         }
+
+        static bool ShouldIgnoreConfigEvent() =>
+            DateTime.UtcNow <= _ignoreConfigEventsUntilUtc;
 
         static void DebounceConfigReload()
         {
@@ -278,7 +311,7 @@ public static class DemoTargetPingPatch
                     UnloadScript(loadedPath);
             }
 
-            if (config.StartWithAllScriptsDisabled)
+            if (!config.ScriptsEnabled)
                 return;
 
             foreach (var script in currentScripts.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
@@ -334,9 +367,9 @@ public static class DemoTargetPingPatch
                 if (string.IsNullOrEmpty(line) || line.StartsWith("#"))
                     continue;
 
-                if (line.Equals("[engine]", StringComparison.OrdinalIgnoreCase))
+                if (line.Equals("[scripts]", StringComparison.OrdinalIgnoreCase))
                 {
-                    currentSection = ConfigSection.Engine;
+                    currentSection = ConfigSection.ScriptsRoot;
                     currentScript = null;
                     continue;
                 }
@@ -354,22 +387,31 @@ public static class DemoTargetPingPatch
                     continue;
 
                 var key = line.Substring(0, equalsIndex).Trim();
-                var value = line.Substring(equalsIndex + 1).Trim();
-                var commentIndex = value.IndexOf('#');
-                if (commentIndex >= 0)
-                    value = value.Substring(0, commentIndex).Trim();
+                var value = StripTomlInlineComment(line.Substring(equalsIndex + 1).Trim());
 
-                if (!TryParseBool(value, out var parsedBool))
-                    continue;
-
-                if (currentSection == ConfigSection.Engine && key.Equals("start_with_all_scripts_disabled", StringComparison.OrdinalIgnoreCase))
+                if (currentSection == ConfigSection.ScriptsRoot && key.Equals("enabled", StringComparison.OrdinalIgnoreCase))
                 {
-                    config.StartWithAllScriptsDisabled = parsedBool;
+                    if (!TryParseBool(value, out var parsedBool))
+                        continue;
+
+                    config.ScriptsEnabled = parsedBool;
                     continue;
                 }
 
-                if (currentSection == ConfigSection.Script && currentScript != null && key.Equals("enabled", StringComparison.OrdinalIgnoreCase))
-                    config.ScriptEnabled[currentScript] = parsedBool;
+                if (currentSection == ConfigSection.Script && currentScript != null)
+                {
+                    if (key.Equals("enabled", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!TryParseBool(value, out var parsedBool))
+                            continue;
+
+                        config.ScriptEnabled[currentScript] = parsedBool;
+                        continue;
+                    }
+
+                    if (key.Equals("error", StringComparison.OrdinalIgnoreCase) && TryParseTomlString(value, out var parsedString))
+                        config.ScriptErrors[currentScript] = parsedString;
+                }
             }
 
             return config;
@@ -379,12 +421,14 @@ public static class DemoTargetPingPatch
         {
             var normalized = new ScriptEngineConfig
             {
-                StartWithAllScriptsDisabled = config.StartWithAllScriptsDisabled,
+                ScriptsEnabled = config.ScriptsEnabled,
             };
 
             foreach (var script in currentScripts.OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
             {
                 normalized.ScriptEnabled[script] = config.ScriptEnabled.TryGetValue(script, out var enabled) ? enabled : true;
+                if (config.ScriptErrors.TryGetValue(script, out var error) && !string.IsNullOrWhiteSpace(error))
+                    normalized.ScriptErrors[script] = error;
             }
 
             return normalized;
@@ -403,15 +447,16 @@ public static class DemoTargetPingPatch
             if (string.Equals(currentContents, contents, StringComparison.Ordinal))
                 return;
 
+            _ignoreConfigEventsUntilUtc = DateTime.UtcNow.AddSeconds(1);
             File.WriteAllText(ConfigPath, contents);
         }
 
         static string SerializeConfig(ScriptEngineConfig config)
         {
             var sb = new StringBuilder();
-            sb.AppendLine("[engine]");
-            sb.Append("start_with_all_scripts_disabled = ");
-            sb.AppendLine(config.StartWithAllScriptsDisabled ? "true" : "false");
+            sb.AppendLine("[scripts]");
+            sb.Append("enabled = ");
+            sb.AppendLine(config.ScriptsEnabled ? "true" : "false");
 
             foreach (var script in config.ScriptEnabled.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
             {
@@ -421,6 +466,12 @@ public static class DemoTargetPingPatch
                 sb.AppendLine("\"]");
                 sb.Append("enabled = ");
                 sb.AppendLine(script.Value ? "true" : "false");
+                if (config.ScriptErrors.TryGetValue(script.Key, out var error) && !string.IsNullOrWhiteSpace(error))
+                {
+                    sb.Append("error = \"");
+                    sb.Append(EscapeTomlString(error));
+                    sb.AppendLine("\"");
+                }
             }
 
             return sb.ToString();
@@ -445,11 +496,72 @@ public static class DemoTargetPingPatch
             WriteConfigIfChanged(_config);
         }
 
+        static void SetScriptsEnabled(bool enabled)
+        {
+            _config.ScriptsEnabled = enabled;
+            _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+            WriteConfigIfChanged(_config);
+            ApplyConfigToRuntime(_config, GetCurrentScripts());
+        }
+
+        static void SetScriptEnabled(string relativePath, bool enabled)
+        {
+            _config.ScriptEnabled[relativePath] = enabled;
+            _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+            WriteConfigIfChanged(_config);
+            ApplyConfigToRuntime(_config, GetCurrentScripts());
+        }
+
+        static void SetScriptError(string relativePath, string? error)
+        {
+            if (string.IsNullOrWhiteSpace(error))
+                _config.ScriptErrors.Remove(relativePath);
+            else
+                _config.ScriptErrors[relativePath] = error;
+
+            _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+            WriteConfigIfChanged(_config);
+        }
+
+        static void DrawWindow(int windowId)
+        {
+            RuntimeGui.BeginVertical();
+            RuntimeGui.Label("F8 toggles this window.");
+
+            lock (_stateLock)
+            {
+                bool scriptsEnabled = _config.ScriptsEnabled;
+                bool nextScriptsEnabled = RuntimeGui.Toggle(scriptsEnabled, "Scripts enabled");
+                if (nextScriptsEnabled != scriptsEnabled)
+                    SetScriptsEnabled(nextScriptsEnabled);
+
+                RuntimeGui.Space(8f);
+                RuntimeGui.Label($"Scripts: {_config.ScriptEnabled.Count}");
+                RuntimeGui.Space(4f);
+
+                _scrollPosition = RuntimeGui.BeginScrollView(_scrollPosition!);
+                foreach (var script in _config.ScriptEnabled.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase).ToList())
+                {
+                    bool nextEnabled = RuntimeGui.Toggle(script.Value, script.Key);
+                    if (nextEnabled != script.Value)
+                        SetScriptEnabled(script.Key, nextEnabled);
+
+                    if (_config.ScriptErrors.TryGetValue(script.Key, out var error) && !string.IsNullOrWhiteSpace(error))
+                        RuntimeGui.Label($"error: {error.Replace("\r", "").Replace("\n", " | ")}");
+                }
+
+                RuntimeGui.EndScrollView();
+            }
+
+            RuntimeGui.EndVertical();
+            RuntimeGui.DragWindow(0f, 0f, 10000f, 24f);
+        }
+
         static bool ShouldLoadScript(string relativePath) => ShouldLoadScript(relativePath, _config);
 
         static bool ShouldLoadScript(string relativePath, ScriptEngineConfig config)
         {
-            if (config.StartWithAllScriptsDisabled)
+            if (!config.ScriptsEnabled)
                 return false;
 
             if (!config.ScriptEnabled.TryGetValue(relativePath, out var enabled))
@@ -487,7 +599,12 @@ public static class DemoTargetPingPatch
         }
 
         static string EscapeTomlString(string value) =>
-            value.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            value
+                .Replace("\\", "\\\\")
+                .Replace("\"", "\\\"")
+                .Replace("\r", "\\r")
+                .Replace("\n", "\\n")
+                .Replace("\t", "\\t");
 
         static string UnescapeTomlString(string value)
         {
@@ -497,7 +614,15 @@ public static class DemoTargetPingPatch
             {
                 if (escaping)
                 {
-                    sb.Append(ch);
+                    sb.Append(ch switch
+                    {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        '"' => '"',
+                        '\\' => '\\',
+                        _ => ch,
+                    });
                     escaping = false;
                     continue;
                 }
@@ -517,6 +642,48 @@ public static class DemoTargetPingPatch
             return sb.ToString();
         }
 
+        static bool TryParseTomlString(string value, out string result)
+        {
+            result = "";
+            if (value.Length < 2 || value[0] != '"' || value[^1] != '"')
+                return false;
+
+            result = UnescapeTomlString(value.Substring(1, value.Length - 2));
+            return true;
+        }
+
+        static string StripTomlInlineComment(string value)
+        {
+            bool inString = false;
+            bool escaping = false;
+            for (int i = 0; i < value.Length; i++)
+            {
+                char ch = value[i];
+                if (escaping)
+                {
+                    escaping = false;
+                    continue;
+                }
+
+                if (ch == '\\' && inString)
+                {
+                    escaping = true;
+                    continue;
+                }
+
+                if (ch == '"')
+                {
+                    inString = !inString;
+                    continue;
+                }
+
+                if (ch == '#' && !inString)
+                    return value.Substring(0, i).TrimEnd();
+            }
+
+            return value;
+        }
+
         static void LoadScript(string path)
         {
             path = Path.GetFullPath(path);
@@ -530,6 +697,9 @@ public static class DemoTargetPingPatch
 
             var assembly = Compile(path, source);
             if (assembly == null) return;
+
+            if (TryGetRelativeScriptPath(path, out var relativePath))
+                SetScriptError(relativePath, null);
 
             // Find and call OnLoad() on any public static class that has it
             Action? onUnload = null;
@@ -618,6 +788,8 @@ public static class DemoTargetPingPatch
                 var errorText = string.Join("\n", errors);
                 MelonLogger.Error($"[ScriptEngine] Compile errors in {Path.GetFileName(path)}:\n  {errorText.Replace("\n", "\n  ")}");
                 File.WriteAllText(logPath, $"Compile errors in {Path.GetFileName(path)}:\n{errorText}\n");
+                if (TryGetRelativeScriptPath(path, out var relativePath))
+                    SetScriptError(relativePath, errorText);
                 return null;
             }
 
@@ -632,14 +804,15 @@ public static class DemoTargetPingPatch
     enum ConfigSection
     {
         None,
-        Engine,
+        ScriptsRoot,
         Script,
     }
 
     class ScriptEngineConfig
     {
-        public bool StartWithAllScriptsDisabled;
+        public bool ScriptsEnabled = true;
         public Dictionary<string, bool> ScriptEnabled = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, string> ScriptErrors = new(StringComparer.OrdinalIgnoreCase);
     }
 
     class LoadedScript
@@ -647,5 +820,217 @@ public static class DemoTargetPingPatch
         public Assembly Assembly;
         public Action? OnUnload;
         public LoadedScript(Assembly assembly, Action? onUnload) { Assembly = assembly; OnUnload = onUnload; }
+    }
+
+    static class RuntimeGui
+    {
+        static bool _initialized;
+        static bool _loggedInitializationFailure;
+        static Type? _inputType;
+        static Type? _keyCodeType;
+        static Type? _guiType;
+        static Type? _guiLayoutType;
+        static Type? _guiLayoutOptionType;
+        static Type? _rectType;
+        static Type? _vector2Type;
+        static Type? _windowFunctionType;
+        static MethodInfo? _inputGetKeyDown;
+        static MethodInfo? _guiWindow;
+        static MethodInfo? _guiDragWindow;
+        static PropertyInfo? _guiDepthProperty;
+        static MethodInfo? _beginVertical;
+        static MethodInfo? _endVertical;
+        static MethodInfo? _label;
+        static MethodInfo? _space;
+        static MethodInfo? _toggle;
+        static MethodInfo? _beginScrollView;
+        static MethodInfo? _endScrollView;
+        static Array? _emptyLayoutOptions;
+
+        public static bool IsAvailable => EnsureInitialized();
+
+        public static bool GetKeyDown(string keyName)
+        {
+            if (!EnsureInitialized())
+                return false;
+
+            object keyCode = Enum.Parse(_keyCodeType!, keyName);
+            return (bool)_inputGetKeyDown!.Invoke(null, new[] { keyCode })!;
+        }
+
+        public static object CreateRect(float x, float y, float width, float height)
+        {
+            EnsureInitializedOrThrow();
+            return Activator.CreateInstance(_rectType!, new object[] { x, y, width, height })!;
+        }
+
+        public static object CreateVector2(float x, float y)
+        {
+            EnsureInitializedOrThrow();
+            return Activator.CreateInstance(_vector2Type!, new object[] { x, y })!;
+        }
+
+        public static void SetDepth(int depth)
+        {
+            if (!EnsureInitialized())
+                return;
+
+            _guiDepthProperty!.SetValue(null, depth);
+        }
+
+        public static object Window(int id, object rect, Action<int> callback, string title)
+        {
+            EnsureInitializedOrThrow();
+            var windowDelegate = Delegate.CreateDelegate(_windowFunctionType!, callback.Target, callback.Method);
+            return _guiWindow!.Invoke(null, new[] { (object)id, rect, windowDelegate, title })!;
+        }
+
+        public static void DragWindow(float x, float y, float width, float height)
+        {
+            if (!EnsureInitialized())
+                return;
+
+            _guiDragWindow!.Invoke(null, new[] { CreateRect(x, y, width, height) });
+        }
+
+        public static void BeginVertical()
+        {
+            EnsureInitializedOrThrow();
+            _beginVertical!.Invoke(null, new object[] { _emptyLayoutOptions! });
+        }
+
+        public static void EndVertical()
+        {
+            if (!EnsureInitialized())
+                return;
+
+            _endVertical!.Invoke(null, Array.Empty<object>());
+        }
+
+        public static void Label(string text)
+        {
+            EnsureInitializedOrThrow();
+            _label!.Invoke(null, new object[] { text, _emptyLayoutOptions! });
+        }
+
+        public static void Space(float pixels)
+        {
+            EnsureInitializedOrThrow();
+            _space!.Invoke(null, new object[] { pixels });
+        }
+
+        public static bool Toggle(bool value, string text)
+        {
+            EnsureInitializedOrThrow();
+            return (bool)_toggle!.Invoke(null, new object[] { value, text, _emptyLayoutOptions! })!;
+        }
+
+        public static object BeginScrollView(object scrollPosition)
+        {
+            EnsureInitializedOrThrow();
+            return _beginScrollView!.Invoke(null, new[] { scrollPosition, _emptyLayoutOptions! })!;
+        }
+
+        public static void EndScrollView()
+        {
+            if (!EnsureInitialized())
+                return;
+
+            _endScrollView!.Invoke(null, Array.Empty<object>());
+        }
+
+        static void EnsureInitializedOrThrow()
+        {
+            if (!EnsureInitialized())
+                throw new InvalidOperationException("Unity IMGUI runtime types are unavailable.");
+        }
+
+        static bool EnsureInitialized()
+        {
+            if (_initialized)
+                return true;
+
+            try
+            {
+                _inputType = FindType("UnityEngine.Input");
+                _keyCodeType = FindType("UnityEngine.KeyCode");
+                _guiType = FindType("UnityEngine.GUI");
+                _guiLayoutType = FindType("UnityEngine.GUILayout");
+                _guiLayoutOptionType = FindType("UnityEngine.GUILayoutOption");
+                _rectType = FindType("UnityEngine.Rect");
+                _vector2Type = FindType("UnityEngine.Vector2");
+
+                if (_inputType == null || _keyCodeType == null || _guiType == null || _guiLayoutType == null || _guiLayoutOptionType == null || _rectType == null || _vector2Type == null)
+                    return false;
+
+                _inputGetKeyDown = _inputType.GetMethod("GetKeyDown", BindingFlags.Public | BindingFlags.Static, null, new[] { _keyCodeType }, null);
+                _guiDepthProperty = _guiType.GetProperty("depth", BindingFlags.Public | BindingFlags.Static);
+                _guiWindow = _guiType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "Window"
+                        && m.GetParameters().Length == 4
+                        && m.GetParameters()[0].ParameterType == typeof(int)
+                        && m.GetParameters()[1].ParameterType == _rectType
+                        && typeof(Delegate).IsAssignableFrom(m.GetParameters()[2].ParameterType)
+                        && m.GetParameters()[3].ParameterType == typeof(string));
+                _guiDragWindow = _guiType.GetMethod("DragWindow", BindingFlags.Public | BindingFlags.Static, null, new[] { _rectType }, null);
+                _beginVertical = _guiLayoutType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "BeginVertical"
+                        && m.GetParameters().Length == 1
+                        && m.GetParameters()[0].ParameterType.IsArray);
+                _endVertical = _guiLayoutType.GetMethod("EndVertical", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
+                _label = _guiLayoutType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "Label"
+                        && m.GetParameters().Length == 2
+                        && m.GetParameters()[0].ParameterType == typeof(string)
+                        && m.GetParameters()[1].ParameterType.IsArray);
+                _space = _guiLayoutType.GetMethod("Space", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(float) }, null);
+                _toggle = _guiLayoutType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "Toggle"
+                        && m.GetParameters().Length == 3
+                        && m.GetParameters()[0].ParameterType == typeof(bool)
+                        && m.GetParameters()[1].ParameterType == typeof(string)
+                        && m.GetParameters()[2].ParameterType.IsArray);
+                _beginScrollView = _guiLayoutType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "BeginScrollView"
+                        && m.GetParameters().Length == 2
+                        && m.GetParameters()[0].ParameterType == _vector2Type
+                        && m.GetParameters()[1].ParameterType.IsArray);
+                _endScrollView = _guiLayoutType.GetMethod("EndScrollView", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
+
+                if (_inputGetKeyDown == null || _guiDepthProperty == null || _guiWindow == null || _guiDragWindow == null || _beginVertical == null || _endVertical == null || _label == null || _space == null || _toggle == null || _beginScrollView == null || _endScrollView == null)
+                    return false;
+
+                _windowFunctionType = _guiWindow.GetParameters()[2].ParameterType;
+                _emptyLayoutOptions = Array.CreateInstance(_guiLayoutOptionType, 0);
+                _initialized = true;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (!_loggedInitializationFailure)
+                {
+                    MelonLogger.Error($"[ScriptEngine] Failed to initialize IMGUI bridge: {ex.Message}");
+                    _loggedInitializationFailure = true;
+                }
+
+                return false;
+            }
+        }
+
+        static Type? FindType(string fullName)
+        {
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    var type = assembly.GetType(fullName, throwOnError: false);
+                    if (type != null)
+                        return type;
+                }
+                catch { }
+            }
+
+            return null;
+        }
     }
 }

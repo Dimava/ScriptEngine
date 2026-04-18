@@ -45,21 +45,24 @@ Place `.cs` files in `<GameDir>/Scripts/`. ScriptEngine scans that folder on sta
 ScriptEngine also maintains `<GameDir>/Scripts/ScriptEngine.cfg` to control which scripts are allowed to load:
 
 ```toml
-[engine]
-start_with_all_scripts_disabled = false
+[scripts]
+enabled = true
 
 [scripts."ConnectionHotkey.cs"]
 enabled = false
 
 [scripts."tetra/TetraRenderer.cs"]
 enabled = true
+error = "The name \"Foo\" does not exist in the current context (12,8)"
 ```
 
 - Script keys are paths relative to `Scripts/`, normalized with `/`
+- `[scripts].enabled` controls the global script system state
 - Missing scripts are added automatically with `enabled = true`
 - Deleted scripts are removed from the config automatically
 - Editing `ScriptEngine.cfg` while the game is running applies immediately
-- If `start_with_all_scripts_disabled = true`, no scripts auto-load until you turn it back off
+- Press `F8` in-game to open a simple ScriptEngine window with a global toggle and per-script toggles
+- `error` is engine-managed and cleared automatically after a successful compile
 
 Your script can be any valid C# file. ScriptEngine finds and calls these two static methods if present:
 
