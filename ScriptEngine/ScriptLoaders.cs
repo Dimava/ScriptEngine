@@ -175,6 +175,16 @@ namespace ScriptEngine
     public abstract class ScriptMod : ScriptModBase
     {
         public GameObject gameObject => (GameObject)_gameObject;
+
+        protected static T FindActiveObjectOfType<T>() where T : UnityEngine.Object
+        {
+            foreach (var obj in Resources.FindObjectsOfTypeAll<T>())
+            {
+                if (obj is Component component && component.gameObject.activeInHierarchy)
+                    return obj;
+            }
+            return default;
+        }
     }
 
     public sealed class ScriptHostBehaviour : MonoBehaviour

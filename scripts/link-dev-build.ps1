@@ -12,15 +12,22 @@ Path to the target MelonLoader game root directory.
 .PARAMETER Configuration
 Build configuration to link from. Defaults to Release.
 
+.PARAMETER Watch
+If set, watches for changes to ScriptEngine.dll and rebuilds + relinks automatically.
+
 .EXAMPLE
 .\link-dev-build.ps1 -GamePath "C:\Games\MyGame"
+.\link-dev-build.ps1 -GamePath "C:\Games\MyGame" -Watch
 #>
 param(
     [Parameter(Mandatory = $true)]
     [string]$GamePath,
 
     [Parameter(Mandatory = $false)]
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+
+    [Parameter(Mandatory = $false)]
+    [switch]$Watch
 )
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
@@ -43,16 +50,60 @@ $files = @(
     @{ Source = Join-Path $outputDir "System.Threading.Tasks.Extensions.dll"; Target = Join-Path $userLibsDir "System.Threading.Tasks.Extensions.dll" }
 )
 
-foreach ($file in $files) {
-    if (-not (Test-Path $file.Source)) {
-        throw "Missing build output: $($file.Source). Run the release build first."
+function Invoke-Link {
+    foreach ($file in $files) {
+        if (-not (Test-Path $file.Source)) {
+            Write-Warning "Missing build output: $($file.Source). Run the build first."
+            return $false
+        }
+
+        if (Test-Path $file.Target) {
+            Remove-Item $file.Target -Force
+        }
+
+        New-Item -ItemType HardLink -Path $file.Target -Target $file.Source | Out-Null
     }
 
-    if (Test-Path $file.Target) {
-        Remove-Item $file.Target -Force
-    }
-
-    New-Item -ItemType HardLink -Path $file.Target -Target $file.Source | Out-Null
+    Write-Host "Linked dev build into $modsDir and $userLibsDir"
+    return $true
 }
 
-Write-Host "Linked dev build into $modsDir and $userLibsDir"
+function Invoke-BuildAndLink {
+    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Building..."
+    $result = & dotnet build (Join-Path $projectRoot "ScriptEngine\ScriptEngine.csproj") -c $Configuration --nologo -v q 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Build failed:`n$result"
+        return
+    }
+    Invoke-Link | Out-Null
+    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Done."
+}
+
+Invoke-Link | Out-Null
+
+if ($Watch) {
+    $srcDir = Join-Path $projectRoot "ScriptEngine"
+    $watcher = [System.IO.FileSystemWatcher]::new($srcDir, "*.cs")
+    $watcher.IncludeSubdirectories = $true
+    $watcher.NotifyFilter = [System.IO.NotifyFilters]::LastWrite
+
+    Write-Host "Watching $srcDir for changes. Press Ctrl+C to stop."
+
+    $pending = $false
+    $lastChange = [datetime]::MinValue
+
+    Invoke-BuildAndLink
+
+    while ($true) {
+        $event = $watcher.WaitForChanged([System.IO.WatcherChangeTypes]::Changed, 200)
+        if (-not $event.TimedOut) {
+            $lastChange = [datetime]::UtcNow
+            $pending = $true
+        }
+
+        if ($pending -and ([datetime]::UtcNow - $lastChange).TotalMilliseconds -ge 500) {
+            $pending = $false
+            Invoke-BuildAndLink
+        }
+    }
+}

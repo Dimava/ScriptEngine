@@ -155,15 +155,22 @@ public static class DemoTargetPingPatch
 
         static void OnFileEvent(object _, FileSystemEventArgs e)
         {
-            if (_debounce.TryGetValue(e.FullPath, out var timer))
-                timer.Dispose();
-
-            _debounce[e.FullPath] = new Timer(_ =>
+            lock (_stateLock)
             {
-                _debounce.Remove(e.FullPath);
-                lock (_stateLock)
-                    HandleScriptChanged(e.FullPath);
-            }, null, 300, Timeout.Infinite);
+                UnloadScript(e.FullPath);
+
+                if (_debounce.TryGetValue(e.FullPath, out var timer))
+                    timer.Dispose();
+
+                _debounce[e.FullPath] = new Timer(_ =>
+                {
+                    lock (_stateLock)
+                    {
+                        _debounce.Remove(e.FullPath);
+                        HandleScriptChanged(e.FullPath);
+                    }
+                }, null, 300, Timeout.Infinite);
+            }
         }
 
         static void OnFileDeleted(object _, FileSystemEventArgs e)
@@ -635,10 +642,6 @@ public static class DemoTargetPingPatch
                 if (nextScriptsEnabled != scriptsEnabled)
                     SetScriptsEnabled(nextScriptsEnabled);
 
-                RuntimeGui.Space(8f);
-                RuntimeGui.Label($"Scripts: {_config.ScriptEnabled.Count}");
-                RuntimeGui.Space(4f);
-
                 _scrollPosition = RuntimeGui.BeginScrollView(_scrollPosition!);
                 foreach (var script in _config.ScriptEnabled.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase).ToList())
                 {
@@ -651,8 +654,6 @@ public static class DemoTargetPingPatch
 
                     if (_config.ScriptErrors.TryGetValue(script.Key, out var error) && !string.IsNullOrWhiteSpace(error))
                         RuntimeGui.Label($"error: {error.Replace("\r", "").Replace("\n", " | ")}");
-
-                    RuntimeGui.Space(6f);
                 }
 
                 RuntimeGui.EndScrollView();
@@ -672,6 +673,7 @@ public static class DemoTargetPingPatch
             if (!_bindingEditorText.TryGetValue(editorKey, out var pendingBinding) || string.Equals(pendingBinding, currentBinding, StringComparison.Ordinal))
                 pendingBinding = currentBinding;
 
+            RuntimeGui.BeginHorizontal();
             RuntimeGui.Label(bindingId);
             var nextPendingBinding = RuntimeGui.TextField(pendingBinding);
             if (!string.Equals(nextPendingBinding, pendingBinding, StringComparison.Ordinal))
@@ -681,24 +683,25 @@ public static class DemoTargetPingPatch
 
             pendingBinding = _bindingEditorText[editorKey];
 
-            if (string.Equals(pendingBinding, currentBinding, StringComparison.Ordinal))
-                return;
-
-            if (!TryNormalizeBindingText(pendingBinding, out var normalizedBinding, out var error))
+            if (!string.Equals(pendingBinding, currentBinding, StringComparison.Ordinal))
             {
-                RuntimeGui.Label($"invalid: {error}");
-                return;
+                if (!TryNormalizeBindingText(pendingBinding, out var normalizedBinding, out _))
+                {
+                    RuntimeGui.Label("!");
+                }
+                else
+                {
+                    if (RuntimeGui.Button("OK"))
+                    {
+                        SetScriptBinding(relativePath, bindingId, normalizedBinding);
+                        _bindingEditorText[editorKey] = normalizedBinding;
+                    }
+                    if (RuntimeGui.Button("X"))
+                        _bindingEditorText[editorKey] = currentBinding;
+                }
             }
 
-            if (RuntimeGui.Button("Apply"))
-            {
-                SetScriptBinding(relativePath, bindingId, normalizedBinding);
-                _bindingEditorText[editorKey] = normalizedBinding;
-                return;
-            }
-
-            if (RuntimeGui.Button("Reset"))
-                _bindingEditorText[editorKey] = currentBinding;
+            RuntimeGui.EndHorizontal();
         }
 
         static bool ShouldLoadScript(string relativePath) => ShouldLoadScript(relativePath, _config);
@@ -754,20 +757,21 @@ public static class DemoTargetPingPatch
             if (TryParseTomlString(key, out var parsedKey))
                 key = parsedKey;
 
-            if (!key.StartsWith("key", StringComparison.OrdinalIgnoreCase) || key.Length <= 3)
+            if (key.Equals("enabled", StringComparison.OrdinalIgnoreCase)
+                || key.Equals("error", StringComparison.OrdinalIgnoreCase))
                 return false;
 
-            bindingId = key.Substring(3);
-            return !string.IsNullOrWhiteSpace(bindingId);
+            if (string.IsNullOrWhiteSpace(key))
+                return false;
+
+            bindingId = key;
+            return true;
         }
 
-        static string MakeBindingConfigKey(string bindingId)
-        {
-            var key = $"key{bindingId}";
-            return IsSimpleTomlKey(key)
-                ? key
-                : $"\"{EscapeTomlString(key)}\"";
-        }
+        static string MakeBindingConfigKey(string bindingId) =>
+            IsSimpleTomlKey(bindingId)
+                ? bindingId
+                : $"\"{EscapeTomlString(bindingId)}\"";
 
         static string MakeBindingEditorKey(string relativePath, string bindingId) => $"{relativePath}\n{bindingId}";
 
@@ -966,6 +970,8 @@ public static class DemoTargetPingPatch
         static PropertyInfo? _guiDepthProperty;
         static MethodInfo? _beginVertical;
         static MethodInfo? _endVertical;
+        static MethodInfo? _beginHorizontal;
+        static MethodInfo? _endHorizontal;
         static MethodInfo? _label;
         static MethodInfo? _space;
         static MethodInfo? _toggle;
@@ -1033,6 +1039,20 @@ public static class DemoTargetPingPatch
                 return;
 
             _endVertical!.Invoke(null, Array.Empty<object>());
+        }
+
+        public static void BeginHorizontal()
+        {
+            EnsureInitializedOrThrow();
+            _beginHorizontal!.Invoke(null, new object[] { _emptyLayoutOptions! });
+        }
+
+        public static void EndHorizontal()
+        {
+            if (!EnsureInitialized())
+                return;
+
+            _endHorizontal!.Invoke(null, Array.Empty<object>());
         }
 
         public static void Label(string text)
@@ -1118,6 +1138,11 @@ public static class DemoTargetPingPatch
                         && m.GetParameters().Length == 1
                         && m.GetParameters()[0].ParameterType.IsArray);
                 _endVertical = _guiLayoutType.GetMethod("EndVertical", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
+                _beginHorizontal = _guiLayoutType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "BeginHorizontal"
+                        && m.GetParameters().Length == 1
+                        && m.GetParameters()[0].ParameterType.IsArray);
+                _endHorizontal = _guiLayoutType.GetMethod("EndHorizontal", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
                 _label = _guiLayoutType.GetMethods(BindingFlags.Public | BindingFlags.Static)
                     .FirstOrDefault(m => m.Name == "Label"
                         && m.GetParameters().Length == 2
@@ -1147,7 +1172,7 @@ public static class DemoTargetPingPatch
                         && m.GetParameters()[1].ParameterType.IsArray);
                 _endScrollView = _guiLayoutType.GetMethod("EndScrollView", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
 
-                if (_inputGetKeyDown == null || _guiDepthProperty == null || _guiWindow == null || _guiDragWindow == null || _beginVertical == null || _endVertical == null || _label == null || _space == null || _toggle == null || _textField == null || _button == null || _beginScrollView == null || _endScrollView == null)
+                if (_inputGetKeyDown == null || _guiDepthProperty == null || _guiWindow == null || _guiDragWindow == null || _beginVertical == null || _endVertical == null || _beginHorizontal == null || _endHorizontal == null || _label == null || _space == null || _toggle == null || _textField == null || _button == null || _beginScrollView == null || _endScrollView == null)
                     return false;
 
                 _windowFunctionType = _guiWindow.GetParameters()[2].ParameterType;

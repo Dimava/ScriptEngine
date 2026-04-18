@@ -155,6 +155,7 @@ namespace ScriptEngine
     internal sealed class ScriptLog
     {
         static readonly object WriteLock = new();
+        static string? _globalErrorLogPath;
 
         readonly string _relativePath;
         readonly string _logPath;
@@ -179,6 +180,8 @@ namespace ScriptEngine
             {
                 MelonLogger.Warning($"[ScriptEngine] Failed to reset session logs: {ex.Message}");
             }
+
+            _globalErrorLogPath = Path.Combine(logsDir, "errors.log");
         }
 
         public static ScriptLog ForScript(string scriptsDir, string relativePath)
@@ -188,27 +191,36 @@ namespace ScriptEngine
             return new ScriptLog(relativePath, logPath);
         }
 
-        public void Info(string message) => Write("Info", message, MelonLogger.Msg);
-        public void Warn(string message) => Write("Warn", message, MelonLogger.Warning);
-        public void Error(string message) => Write("Error", message, MelonLogger.Error);
+        public void Info(string message) => Write("Info", message, MelonLogger.Msg, global: false);
+        public void Warn(string message) => Write("Warn", message, MelonLogger.Warning, global: false);
+        public void Error(string message) => Write("Error", message, MelonLogger.Error, global: true);
 
-        void Write(string level, string message, Action<string> melonWrite)
+        void Write(string level, string message, Action<string> melonWrite, bool global)
         {
             var formatted = $"[{DateTime.Now:HH:mm:ss.fff}] [{level}] {message}";
             melonWrite($"[{_relativePath}] {message}");
 
+            lock (WriteLock)
+            {
+                AppendToFile(_logPath, formatted);
+                if (global && _globalErrorLogPath != null)
+                    AppendToFile(_globalErrorLogPath, $"[{DateTime.Now:HH:mm:ss.fff}] [{_relativePath}] {message}");
+            }
+        }
+
+        static void AppendToFile(string path, string line)
+        {
             try
             {
-                var directory = Path.GetDirectoryName(_logPath);
+                var directory = Path.GetDirectoryName(path);
                 if (!string.IsNullOrEmpty(directory))
                     Directory.CreateDirectory(directory);
 
-                lock (WriteLock)
-                    File.AppendAllText(_logPath, formatted + Environment.NewLine);
+                File.AppendAllText(path, line + Environment.NewLine);
             }
             catch (Exception ex)
             {
-                MelonLogger.Warning($"[ScriptEngine] Failed to write log for {_relativePath}: {ex.Message}");
+                MelonLogger.Warning($"[ScriptEngine] Failed to write log: {ex.Message}");
             }
         }
     }
