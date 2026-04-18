@@ -42,6 +42,25 @@ If you are building from source, package the release files with `.\scripts\packa
 
 Place `.cs` files in `<GameDir>/Scripts/`. ScriptEngine scans that folder on startup and watches for changes.
 
+ScriptEngine also maintains `<GameDir>/Scripts/ScriptEngine.cfg` to control which scripts are allowed to load:
+
+```toml
+[engine]
+start_with_all_scripts_disabled = false
+
+[scripts."ConnectionHotkey.cs"]
+enabled = false
+
+[scripts."tetra/TetraRenderer.cs"]
+enabled = true
+```
+
+- Script keys are paths relative to `Scripts/`, normalized with `/`
+- Missing scripts are added automatically with `enabled = true`
+- Deleted scripts are removed from the config automatically
+- Editing `ScriptEngine.cfg` while the game is running applies immediately
+- If `start_with_all_scripts_disabled = true`, no scripts auto-load until you turn it back off
+
 Your script can be any valid C# file. ScriptEngine finds and calls these two static methods if present:
 
 ```csharp

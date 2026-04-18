@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using MelonLoader;
 using MelonLoader.Utils;
@@ -18,6 +20,8 @@ namespace ScriptEngine
     {
         static string ScriptsDir = null!;
         static string GameDir = null!;
+        static string ConfigPath = null!;
+        const string ConfigFileName = "ScriptEngine.cfg";
         const string StarterScriptName = "HelloWorld.cs";
         const string StarterScriptContents =
 @"using HarmonyLib;
@@ -89,37 +93,54 @@ public static class DemoTargetPingPatch
 }";
 
         // track loaded scripts: file path -> (assembly, onUnload action)
-        static readonly Dictionary<string, LoadedScript> _loaded = new();
+        static readonly Dictionary<string, LoadedScript> _loaded = new(StringComparer.OrdinalIgnoreCase);
+        static readonly object _stateLock = new();
+        static readonly Regex ScriptSectionRegex = new(@"^\[scripts\.""((?:\\.|[^""])*)""\]\s*$", RegexOptions.Compiled);
+        static readonly Dictionary<string, Timer> _debounce = new(StringComparer.OrdinalIgnoreCase);
+        static Timer? _configDebounce;
         static FileSystemWatcher _watcher = null!;
+        static FileSystemWatcher _configWatcher = null!;
+        static ScriptEngineConfig _config = new();
 
         public override void OnInitializeMelon()
         {
             GameDir = MelonEnvironment.GameRootDirectory;
             ScriptsDir = Path.Combine(GameDir, "Scripts");
+            ConfigPath = Path.Combine(ScriptsDir, ConfigFileName);
             Directory.CreateDirectory(ScriptsDir);
             EnsureStarterScript();
+            lock (_stateLock)
+                ReloadConfigFromDiskAndApply();
 
             LoggerInstance.Msg($"ScriptEngine watching: {ScriptsDir}");
-
-            // Load all existing scripts
-            foreach (var file in Directory.GetFiles(ScriptsDir, "*.cs", SearchOption.TopDirectoryOnly))
-                LoadScript(file);
 
             // Watch for changes
             _watcher = new FileSystemWatcher(ScriptsDir, "*.cs")
             {
                 NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.CreationTime,
+                IncludeSubdirectories = true,
                 EnableRaisingEvents = true,
             };
             _watcher.Changed += OnFileEvent;
             _watcher.Created += OnFileEvent;
             _watcher.Deleted += OnFileDeleted;
             _watcher.Renamed += OnFileRenamed;
+
+            _configWatcher = new FileSystemWatcher(ScriptsDir, "*.cfg")
+            {
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.CreationTime,
+                IncludeSubdirectories = false,
+                EnableRaisingEvents = true,
+            };
+            _configWatcher.Changed += OnConfigEvent;
+            _configWatcher.Created += OnConfigEvent;
+            _configWatcher.Deleted += OnConfigEvent;
+            _configWatcher.Renamed += OnConfigRenamed;
         }
 
         static void EnsureStarterScript()
         {
-            if (Directory.GetFiles(ScriptsDir, "*.cs", SearchOption.TopDirectoryOnly).Length != 0)
+            if (Directory.GetFiles(ScriptsDir, "*.cs", SearchOption.AllDirectories).Length != 0)
                 return;
 
             var starterScriptPath = Path.Combine(ScriptsDir, StarterScriptName);
@@ -130,29 +151,376 @@ public static class DemoTargetPingPatch
         }
 
         // Debounce: FSW fires multiple events per save
-        static readonly Dictionary<string, Timer> _debounce = new();
-
         static void OnFileEvent(object _, FileSystemEventArgs e)
         {
             if (_debounce.TryGetValue(e.FullPath, out var t)) t.Dispose();
             _debounce[e.FullPath] = new Timer(_ =>
             {
                 _debounce.Remove(e.FullPath);
-                MelonLogger.Msg($"[ScriptEngine] Reloading: {Path.GetFileName(e.FullPath)}");
-                LoadScript(e.FullPath);
+                lock (_stateLock)
+                    HandleScriptChanged(e.FullPath);
             }, null, 300, Timeout.Infinite);
         }
 
-        static void OnFileDeleted(object _, FileSystemEventArgs e) => UnloadScript(e.FullPath);
+        static void OnFileDeleted(object _, FileSystemEventArgs e)
+        {
+            lock (_stateLock)
+                HandleScriptDeleted(e.FullPath);
+        }
 
         static void OnFileRenamed(object _, RenamedEventArgs e)
         {
-            UnloadScript(e.OldFullPath);
-            if (e.FullPath.EndsWith(".cs")) LoadScript(e.FullPath);
+            lock (_stateLock)
+                HandleScriptRenamed(e.OldFullPath, e.FullPath);
+        }
+
+        static void OnConfigEvent(object _, FileSystemEventArgs e)
+        {
+            if (!IsConfigPath(e.FullPath))
+                return;
+
+            DebounceConfigReload();
+        }
+
+        static void OnConfigRenamed(object _, RenamedEventArgs e)
+        {
+            if (!IsConfigPath(e.OldFullPath) && !IsConfigPath(e.FullPath))
+                return;
+
+            DebounceConfigReload();
+        }
+
+        static void DebounceConfigReload()
+        {
+            _configDebounce?.Dispose();
+            _configDebounce = new Timer(_ =>
+            {
+                lock (_stateLock)
+                    ReloadConfigFromDiskAndApply();
+            }, null, 300, Timeout.Infinite);
+        }
+
+        static void HandleScriptChanged(string path)
+        {
+            if (!File.Exists(path))
+                return;
+
+            if (!TryGetRelativeScriptPath(path, out var relativePath))
+                return;
+
+            EnsureScriptConfigEntry(relativePath, enabled: true);
+            if (!ShouldLoadScript(relativePath))
+            {
+                UnloadScript(path);
+                MelonLogger.Msg($"[ScriptEngine] Ignoring disabled script: {relativePath}");
+                return;
+            }
+
+            MelonLogger.Msg($"[ScriptEngine] Reloading: {relativePath}");
+            LoadScript(path);
+        }
+
+        static void HandleScriptDeleted(string path)
+        {
+            if (!TryGetRelativeScriptPath(path, out var relativePath))
+                return;
+
+            UnloadScript(path);
+            RemoveScriptConfigEntry(relativePath);
+        }
+
+        static void HandleScriptRenamed(string oldPath, string newPath)
+        {
+            string? oldRelativePath = TryGetRelativeScriptPath(oldPath, out var oldRel) ? oldRel : null;
+            string? newRelativePath = TryGetRelativeScriptPath(newPath, out var newRel) ? newRel : null;
+
+            UnloadScript(oldPath);
+
+            if (oldRelativePath != null)
+                RemoveScriptConfigEntry(oldRelativePath);
+
+            if (newRelativePath == null)
+                return;
+
+            EnsureScriptConfigEntry(newRelativePath, enabled: true, overwrite: true);
+            if (!ShouldLoadScript(newRelativePath))
+            {
+                MelonLogger.Msg($"[ScriptEngine] Ignoring disabled script: {newRelativePath}");
+                return;
+            }
+
+            MelonLogger.Msg($"[ScriptEngine] Reloading: {newRelativePath}");
+            LoadScript(newPath);
+        }
+
+        static void ReloadConfigFromDiskAndApply()
+        {
+            var currentScripts = GetCurrentScripts();
+            var parsedConfig = ReadConfigFromDisk();
+            var normalizedConfig = NormalizeConfig(parsedConfig, currentScripts.Keys);
+
+            _config = normalizedConfig;
+            WriteConfigIfChanged(normalizedConfig);
+            ApplyConfigToRuntime(normalizedConfig, currentScripts);
+        }
+
+        static void ApplyConfigToRuntime(ScriptEngineConfig config, Dictionary<string, string> currentScripts)
+        {
+            foreach (var loadedPath in _loaded.Keys.ToList())
+            {
+                if (!TryGetRelativeScriptPath(loadedPath, out var relativePath))
+                {
+                    UnloadScript(loadedPath);
+                    continue;
+                }
+
+                if (!currentScripts.ContainsKey(relativePath) || !ShouldLoadScript(relativePath, config))
+                    UnloadScript(loadedPath);
+            }
+
+            if (config.StartWithAllScriptsDisabled)
+                return;
+
+            foreach (var script in currentScripts.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                if (!ShouldLoadScript(script.Key, config))
+                    continue;
+
+                if (_loaded.ContainsKey(script.Value))
+                    continue;
+
+                MelonLogger.Msg($"[ScriptEngine] Loading enabled script: {script.Key}");
+                LoadScript(script.Value);
+            }
+        }
+
+        static Dictionary<string, string> GetCurrentScripts()
+        {
+            var scripts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var file in Directory.GetFiles(ScriptsDir, "*.cs", SearchOption.AllDirectories))
+            {
+                if (!TryGetRelativeScriptPath(file, out var relativePath))
+                    continue;
+
+                scripts[relativePath] = Path.GetFullPath(file);
+            }
+
+            return scripts;
+        }
+
+        static ScriptEngineConfig ReadConfigFromDisk()
+        {
+            var config = new ScriptEngineConfig();
+            if (!File.Exists(ConfigPath))
+                return config;
+
+            string[] lines;
+            try
+            {
+                lines = File.ReadAllLines(ConfigPath);
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error($"[ScriptEngine] Failed to read {ConfigFileName}: {ex.Message}");
+                return config;
+            }
+
+            ConfigSection currentSection = ConfigSection.None;
+            string? currentScript = null;
+
+            foreach (var rawLine in lines)
+            {
+                var line = rawLine.Trim();
+                if (string.IsNullOrEmpty(line) || line.StartsWith("#"))
+                    continue;
+
+                if (line.Equals("[engine]", StringComparison.OrdinalIgnoreCase))
+                {
+                    currentSection = ConfigSection.Engine;
+                    currentScript = null;
+                    continue;
+                }
+
+                var scriptSectionMatch = ScriptSectionRegex.Match(line);
+                if (scriptSectionMatch.Success)
+                {
+                    currentSection = ConfigSection.Script;
+                    currentScript = UnescapeTomlString(scriptSectionMatch.Groups[1].Value);
+                    continue;
+                }
+
+                var equalsIndex = line.IndexOf('=');
+                if (equalsIndex < 0)
+                    continue;
+
+                var key = line.Substring(0, equalsIndex).Trim();
+                var value = line.Substring(equalsIndex + 1).Trim();
+                var commentIndex = value.IndexOf('#');
+                if (commentIndex >= 0)
+                    value = value.Substring(0, commentIndex).Trim();
+
+                if (!TryParseBool(value, out var parsedBool))
+                    continue;
+
+                if (currentSection == ConfigSection.Engine && key.Equals("start_with_all_scripts_disabled", StringComparison.OrdinalIgnoreCase))
+                {
+                    config.StartWithAllScriptsDisabled = parsedBool;
+                    continue;
+                }
+
+                if (currentSection == ConfigSection.Script && currentScript != null && key.Equals("enabled", StringComparison.OrdinalIgnoreCase))
+                    config.ScriptEnabled[currentScript] = parsedBool;
+            }
+
+            return config;
+        }
+
+        static ScriptEngineConfig NormalizeConfig(ScriptEngineConfig config, IEnumerable<string> currentScripts)
+        {
+            var normalized = new ScriptEngineConfig
+            {
+                StartWithAllScriptsDisabled = config.StartWithAllScriptsDisabled,
+            };
+
+            foreach (var script in currentScripts.OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+            {
+                normalized.ScriptEnabled[script] = config.ScriptEnabled.TryGetValue(script, out var enabled) ? enabled : true;
+            }
+
+            return normalized;
+        }
+
+        static void WriteConfigIfChanged(ScriptEngineConfig config)
+        {
+            var contents = SerializeConfig(config);
+            string? currentContents = null;
+            if (File.Exists(ConfigPath))
+            {
+                try { currentContents = File.ReadAllText(ConfigPath); }
+                catch { }
+            }
+
+            if (string.Equals(currentContents, contents, StringComparison.Ordinal))
+                return;
+
+            File.WriteAllText(ConfigPath, contents);
+        }
+
+        static string SerializeConfig(ScriptEngineConfig config)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("[engine]");
+            sb.Append("start_with_all_scripts_disabled = ");
+            sb.AppendLine(config.StartWithAllScriptsDisabled ? "true" : "false");
+
+            foreach (var script in config.ScriptEnabled.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                sb.AppendLine();
+                sb.Append("[scripts.\"");
+                sb.Append(EscapeTomlString(script.Key));
+                sb.AppendLine("\"]");
+                sb.Append("enabled = ");
+                sb.AppendLine(script.Value ? "true" : "false");
+            }
+
+            return sb.ToString();
+        }
+
+        static void EnsureScriptConfigEntry(string relativePath, bool enabled, bool overwrite = false)
+        {
+            if (!overwrite && _config.ScriptEnabled.ContainsKey(relativePath))
+                return;
+
+            _config.ScriptEnabled[relativePath] = enabled;
+            _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+            WriteConfigIfChanged(_config);
+        }
+
+        static void RemoveScriptConfigEntry(string relativePath)
+        {
+            if (!_config.ScriptEnabled.Remove(relativePath))
+                return;
+
+            _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+            WriteConfigIfChanged(_config);
+        }
+
+        static bool ShouldLoadScript(string relativePath) => ShouldLoadScript(relativePath, _config);
+
+        static bool ShouldLoadScript(string relativePath, ScriptEngineConfig config)
+        {
+            if (config.StartWithAllScriptsDisabled)
+                return false;
+
+            if (!config.ScriptEnabled.TryGetValue(relativePath, out var enabled))
+                return true;
+
+            return enabled;
+        }
+
+        static bool TryGetRelativeScriptPath(string path, out string relativePath)
+        {
+            relativePath = "";
+
+            if (!path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var fullPath = Path.GetFullPath(path);
+            var relative = Path.GetRelativePath(ScriptsDir, fullPath);
+            if (relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative))
+                return false;
+
+            relativePath = relative.Replace('\\', '/');
+            return true;
+        }
+
+        static bool IsConfigPath(string path) =>
+            string.Equals(Path.GetFullPath(path), Path.GetFullPath(ConfigPath), StringComparison.OrdinalIgnoreCase);
+
+        static bool TryParseBool(string value, out bool result)
+        {
+            if (bool.TryParse(value, out result))
+                return true;
+
+            result = false;
+            return false;
+        }
+
+        static string EscapeTomlString(string value) =>
+            value.Replace("\\", "\\\\").Replace("\"", "\\\"");
+
+        static string UnescapeTomlString(string value)
+        {
+            var sb = new StringBuilder(value.Length);
+            bool escaping = false;
+            foreach (var ch in value)
+            {
+                if (escaping)
+                {
+                    sb.Append(ch);
+                    escaping = false;
+                    continue;
+                }
+
+                if (ch == '\\')
+                {
+                    escaping = true;
+                    continue;
+                }
+
+                sb.Append(ch);
+            }
+
+            if (escaping)
+                sb.Append('\\');
+
+            return sb.ToString();
         }
 
         static void LoadScript(string path)
         {
+            path = Path.GetFullPath(path);
+
             // Unload previous version first
             UnloadScript(path);
 
@@ -185,6 +553,7 @@ public static class DemoTargetPingPatch
 
         static void UnloadScript(string path)
         {
+            path = Path.GetFullPath(path);
             if (!_loaded.TryGetValue(path, out var script)) return;
             script.OnUnload?.Invoke();
             _loaded.Remove(path);
@@ -258,6 +627,19 @@ public static class DemoTargetPingPatch
             ms.Seek(0, SeekOrigin.Begin);
             return Assembly.Load(ms.ToArray());
         }
+    }
+
+    enum ConfigSection
+    {
+        None,
+        Engine,
+        Script,
+    }
+
+    class ScriptEngineConfig
+    {
+        public bool StartWithAllScriptsDisabled;
+        public Dictionary<string, bool> ScriptEnabled = new(StringComparer.OrdinalIgnoreCase);
     }
 
     class LoadedScript
