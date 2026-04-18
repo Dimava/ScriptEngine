@@ -11,7 +11,6 @@ namespace ScriptEngine
 {
     internal enum ScriptKind
     {
-        LegacyStatic,
         Attribute,
     }
 
@@ -28,6 +27,7 @@ namespace ScriptEngine
         public string RelativePath = "";
         public ScriptKind Kind;
         public Assembly Assembly = null!;
+        public ScriptModBase? Mod;
         public Action? OnUnload;
         public ScriptLog Log = null!;
     }
@@ -140,9 +140,6 @@ namespace ScriptEngine
             if (ContainsScriptEntry(root))
                 return ScriptKind.Attribute;
 
-            if (ContainsLegacyLifecycle(root))
-                return ScriptKind.LegacyStatic;
-
             return null;
         }
 
@@ -150,15 +147,6 @@ namespace ScriptEngine
             root.DescendantNodes()
                 .OfType<ClassDeclarationSyntax>()
                 .Any(HasScriptEntryAttribute);
-
-        static bool ContainsLegacyLifecycle(SyntaxNode root) =>
-            root.DescendantNodes()
-                .OfType<MethodDeclarationSyntax>()
-                .Any(method =>
-                    (method.Identifier.ValueText == "OnLoad" || method.Identifier.ValueText == "OnUnload")
-                    && method.ParameterList.Parameters.Count == 0
-                    && method.Modifiers.Any(m => m.IsKind(SyntaxKind.PublicKeyword))
-                    && method.Modifiers.Any(m => m.IsKind(SyntaxKind.StaticKeyword)));
 
         static bool HasScriptEntryAttribute(ClassDeclarationSyntax classDeclaration) =>
             classDeclaration.AttributeLists
@@ -186,7 +174,7 @@ namespace ScriptEngine
 
     public abstract class ScriptMod : ScriptModBase
     {
-        public GameObject gameObject => (GameObject)gameObjectObject;
+        public GameObject gameObject => (GameObject)_gameObject;
     }
 
     public sealed class ScriptHostBehaviour : MonoBehaviour
@@ -322,80 +310,6 @@ namespace ScriptEngine
         LoadedScript? Load(DiscoveredScript script, Assembly assembly, ScriptLog log, Action<string, string, Exception> runtimeExceptionHandler, out string? errorText);
     }
 
-    internal sealed class LegacyStaticScriptLoader : IScriptLoader
-    {
-        public ScriptKind Kind => ScriptKind.LegacyStatic;
-
-        public LoadedScript? Load(DiscoveredScript script, Assembly assembly, ScriptLog log, Action<string, string, Exception> runtimeExceptionHandler, out string? errorText)
-        {
-            errorText = null;
-            var onUnloadActions = new List<Action>();
-            var onLoadMethods = new List<(Type Type, MethodInfo Method)>();
-
-            foreach (var type in assembly.GetTypes())
-            {
-                var onLoad = type.GetMethod("OnLoad", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
-                if (onLoad != null)
-                    onLoadMethods.Add((type, onLoad));
-
-                var onUnload = type.GetMethod("OnUnload", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
-                if (onUnload != null)
-                    onUnloadActions.Add(() => onUnload.Invoke(null, null));
-            }
-
-            if (onLoadMethods.Count == 0 && onUnloadActions.Count == 0)
-            {
-                errorText = "No public static OnLoad/OnUnload methods were found.";
-                log.Error(errorText);
-                return null;
-            }
-
-            try
-            {
-                foreach (var onLoad in onLoadMethods)
-                    onLoad.Method.Invoke(null, null);
-            }
-            catch (TargetInvocationException ex)
-            {
-                errorText = ex.InnerException?.ToString() ?? ex.ToString();
-                log.Error($"OnLoad failed: {errorText}");
-                TryRunUnload(onUnloadActions, log);
-                return null;
-            }
-            catch (Exception ex)
-            {
-                errorText = ex.ToString();
-                log.Error($"OnLoad failed: {errorText}");
-                TryRunUnload(onUnloadActions, log);
-                return null;
-            }
-
-            log.Info("Loaded.");
-            return new LoadedScript
-            {
-                FullPath = script.FullPath,
-                RelativePath = script.RelativePath,
-                Kind = script.Kind,
-                Assembly = assembly,
-                Log = log,
-                OnUnload = () =>
-                {
-                    TryRunUnload(onUnloadActions, log);
-                    log.Info("Unloaded.");
-                }
-            };
-        }
-
-        static void TryRunUnload(IEnumerable<Action> unloadActions, ScriptLog log)
-        {
-            foreach (var unload in unloadActions)
-            {
-                try { unload(); }
-                catch (Exception ex) { log.Error($"OnUnload failed: {ex}"); }
-            }
-        }
-    }
-
     internal sealed class AttributeScriptLoader : IScriptLoader
     {
         public ScriptKind Kind => ScriptKind.Attribute;
@@ -427,33 +341,30 @@ namespace ScriptEngine
                 return null;
             }
 
-            if (entryType.GetConstructor(Type.EmptyTypes) == null)
-            {
-                errorText = "[ScriptEntry] class must have a public parameterless constructor.";
-                log.Error(errorText);
-                return null;
-            }
-
-            ScriptModBase mod;
-            try
-            {
-                mod = (ScriptModBase)Activator.CreateInstance(entryType)!;
-            }
-            catch (Exception ex)
-            {
-                errorText = ex.ToString();
-                log.Error($"Failed to create script instance: {errorText}");
-                return null;
-            }
-
             object? gameObject = null;
             object? harmony = null;
             object? hostBehaviour = null;
+            ScriptModBase? mod = null;
             try
             {
                 harmony = HarmonyRuntime.Create("scriptengine." + script.RelativePath.Replace('/', '.').Replace('\\', '.'));
                 gameObject = UnityRuntime.CreatePersistentGameObject($"__ScriptEngine::{script.RelativePath}__");
-                mod.ScriptEngineInitialize(script.FullPath, script.RelativePath, log, gameObject, (callbackName, ex) => runtimeExceptionHandler(script.RelativePath, callbackName, ex));
+                ScriptModBase.PendingInit = new ScriptInitContext
+                {
+                    ScriptId = script.RelativePath,
+                    Log = log,
+                    GameObject = gameObject,
+                    RuntimeExceptionHandler = (callbackName, ex) => runtimeExceptionHandler(script.RelativePath, callbackName, ex),
+                    BindingRegistrar = (bindingId, defaultBinding) => ScriptEngineMod.RegisterScriptKeyBinding(script.RelativePath, bindingId, defaultBinding),
+                };
+                try
+                {
+                    mod = (ScriptModBase)Activator.CreateInstance(entryType)!;
+                }
+                finally
+                {
+                    ScriptModBase.PendingInit = null;
+                }
 
                 var hostType = assembly.GetType("ScriptEngine.ScriptHostBehaviour", throwOnError: false);
                 if (hostType == null)
@@ -490,6 +401,7 @@ namespace ScriptEngine
                 RelativePath = script.RelativePath,
                 Kind = script.Kind,
                 Assembly = assembly,
+                Mod = mod!,
                 Log = log,
                 OnUnload = () =>
                 {
@@ -528,10 +440,13 @@ namespace ScriptEngine
                     return name == "ScriptEngine.ScriptEntryAttribute" || name.EndsWith(".ScriptEntryAttribute", StringComparison.Ordinal);
                 });
 
-        static void CleanupFailedLoad(ScriptModBase mod, object? hostBehaviour, object? gameObject, object? harmony, ScriptLog log)
+        static void CleanupFailedLoad(ScriptModBase? mod, object? hostBehaviour, object? gameObject, object? harmony, ScriptLog log)
         {
-            try { mod.ScriptEngineInvokeDisable(); }
-            catch { }
+            if (mod != null)
+            {
+                try { mod.ScriptEngineInvokeDisable(); }
+                catch { }
+            }
 
             try
             {
@@ -545,12 +460,6 @@ namespace ScriptEngine
 
             try
             {
-                if (hostBehaviour != null)
-                {
-                    var gameObjectProperty = hostBehaviour.GetType().GetProperty("gameObject", BindingFlags.Public | BindingFlags.Instance);
-                    gameObject ??= gameObjectProperty?.GetValue(hostBehaviour);
-                }
-
                 if (gameObject != null)
                     UnityRuntime.DestroyObject(gameObject);
             }
@@ -559,7 +468,7 @@ namespace ScriptEngine
                 log.Error($"Cleanup failed: {ex}");
             }
 
-            mod.ScriptEngineClearHostObject();
+            mod?.ScriptEngineClearHostObject();
         }
     }
 }

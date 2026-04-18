@@ -14,7 +14,7 @@ On save:
 1. `FileSystemWatcher` detects the change (debounced 300ms)
 2. Previous version is unloaded
 3. Roslyn compiles the file in-memory
-4. New assembly is loaded through either the legacy static loader or the new `[ScriptEntry]` loader
+4. New assembly is loaded through the `[ScriptEntry]` / `ScriptMod` loader
 
 ## Installation
 
@@ -44,8 +44,7 @@ Place `.cs` files in `<GameDir>/Scripts/`. ScriptEngine scans that folder on sta
 
 Discovery rules:
 
-- New-style scripts are `.cs` files with exactly one `[ScriptEntry]` class deriving from `ScriptMod`
-- Legacy scripts are `.cs` files with public static `OnLoad()` / `OnUnload()` hooks
+- Scripts are `.cs` files with exactly one `[ScriptEntry]` class deriving from `ScriptMod`
 - Other `.cs` files are ignored
 - Directories whose name starts with `.` are ignored
 - `bin`, `obj`, and `node_modules` are ignored
@@ -58,6 +57,8 @@ enabled = true
 
 [scripts."ConnectionHotkey.cs"]
 enabled = false
+keyCopy = "Ctrl+C"
+keyPaste = "Ctrl+V"
 
 [scripts."tetra/TetraRenderer.cs"]
 enabled = true
@@ -67,15 +68,16 @@ error = "The name \"Foo\" does not exist in the current context (12,8)"
 - Script keys are paths relative to `Scripts/`, normalized with `/`
 - `[scripts].enabled` controls the global script system state
 - Missing scripts are added automatically with `enabled = true`
+- Registered script keys are stored as flat `key...` entries inside the script section
 - Deleted scripts are removed from the config automatically
 - Editing `ScriptEngine.cfg` while the game is running applies immediately
-- Press `F8` in-game to open a simple ScriptEngine window with a global toggle and per-script toggles
+- Press `F8` in-game to open a simple ScriptEngine window with a global toggle, per-script toggles, and editable keybinding text fields
 - `error` is engine-managed and cleared automatically after a successful compile
 - Runtime callback exceptions disable the script and write the exception into `error`
 - Per-script logs are written to `Scripts/logs/<relative-script-path>.log`
 - The `Scripts/logs/` session logs are reset on game launch, not on hot-reload
 
-## New-style scripts
+## Writing `ScriptMod` scripts
 
 Recommended format:
 
@@ -88,12 +90,18 @@ public sealed class Hello : ScriptMod
 {
     protected override void OnEnable()
     {
-        Log("Hello!");
+        Log("After the script was loaded (duplicated log).");
+        keys.Register("Copy", "Ctrl+C");
+        keys.Register("Paste", "Ctrl+V");
     }
 
     protected override void OnUpdate()
     {
-        // runs every frame
+        if (keys["Copy"].WasPressedThisFrame)
+            Log("Copy pressed.");
+
+        if (keys.WasPressed("Paste"))
+            Log("Paste pressed.");
     }
 }
 ```
@@ -110,50 +118,24 @@ Available `ScriptMod` lifecycle methods:
 `ScriptMod` also exposes:
 
 - `gameObject`
+- `keys.Register("Id", "Ctrl+X")`
+- `keys["Id"].WasPressedThisFrame`
+- `keys["Id"].IsPressed`
+- `keys.WasPressed("Id")`
+- `keys.IsDown("Id")`
 - `Log(string)`
 - `Warn(string)`
 - `Error(string)`
 
-Harmony patches are applied automatically for new-style scripts. Any `[HarmonyPatch]` type in the script file's compiled assembly is patched on load and unpatched on unload.
+Keybinding notes:
 
-## Legacy scripts
+- The key id is also the GUI label and the cfg suffix, so `keys.Register("Copy", "Ctrl+C")` writes `keyCopy = "Ctrl+C"`
+- Supported combos are a single primary key plus optional `Ctrl`, `Shift`, and/or `Alt`
+- Empty bindings are allowed and simply never fire
 
-The old static loader still works during transition. ScriptEngine finds and calls these two static methods if present:
+Load and unload are already logged by ScriptEngine itself, so you usually should not add `Log("Loaded.")` / `Log("Unloaded.")` in `OnEnable` and `OnDisable`.
 
-```csharp
-public static void OnLoad()   { /* called after compile / hot-reload */ }
-public static void OnUnload() { /* called before reload or on file delete */ }
-```
-
-All game types, UnityEngine, MelonLoader, and Harmony are available without any imports beyond `using` directives.
-
-### Legacy Harmony example
-
-```csharp
-using HarmonyLib;
-using MelonLoader;
-
-public static class MyPatch
-{
-    static HarmonyLib.Harmony _h = new("mypatch");
-
-    public static void OnLoad()
-    {
-        _h.UnpatchSelf();
-        _h.PatchAll(typeof(MyPatch).Assembly);
-    }
-
-    public static void OnUnload() => _h.UnpatchSelf();
-}
-
-[HarmonyPatch(typeof(SomeClass), nameof(SomeClass.SomeMethod))]
-static class SomeClass_SomeMethod_Patch
-{
-    static void Prefix() => MelonLogger.Msg("Before SomeMethod!");
-}
-```
-
-Calling `_h.UnpatchSelf()` at the start of `OnLoad` ensures patches don't stack up on hot-reload.
+Harmony patches are applied automatically for `ScriptMod` scripts. Any `[HarmonyPatch]` type in the script file's compiled assembly is patched on load and unpatched on unload.
 
 ## Exploring game code
 
@@ -197,7 +179,7 @@ For local development, you can hard-link the current build output into the game'
 ScriptEngine/
   ScriptEngine.csproj   — project file, references MelonLoader + Roslyn
   ScriptEngineMod.cs    — the mod: FSW, config, UI
-  ScriptLoaders.cs      — discovery, compiler, legacy/new loaders
+  ScriptLoaders.cs      — discovery, compiler, and `[ScriptEntry]` loader
   ScriptApi.cs          — shared script base and per-script log sink
   ScriptRuntime.cs      — reflection wrappers for Unity/Harmony host integration
   README.md

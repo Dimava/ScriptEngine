@@ -33,7 +33,7 @@ public sealed class HelloWorld : ScriptMod
 
     protected override void OnEnable()
     {
-        Log(""Hello from ScriptEngine!"");
+        Log(""After the script was loaded (duplicated log)."");
         DemoTarget.Ping();
     }
 
@@ -67,12 +67,12 @@ public static class DemoTargetPingPatch
         static readonly Dictionary<string, LoadedScript> _loaded = new(StringComparer.OrdinalIgnoreCase);
         static readonly Dictionary<ScriptKind, IScriptLoader> _loaders = new()
         {
-            [ScriptKind.LegacyStatic] = new LegacyStaticScriptLoader(),
             [ScriptKind.Attribute] = new AttributeScriptLoader(),
         };
         static readonly object _stateLock = new();
         static readonly Regex ScriptSectionRegex = new(@"^\[scripts\.""((?:\\.|[^""])*)""\]\s*$", RegexOptions.Compiled);
         static readonly Dictionary<string, Timer> _debounce = new(StringComparer.OrdinalIgnoreCase);
+        static readonly Dictionary<string, string> _bindingEditorText = new(StringComparer.OrdinalIgnoreCase);
         static Timer? _configDebounce;
         static string? _ignoredConfigContents;
         static bool _showUi;
@@ -143,7 +143,7 @@ public static class DemoTargetPingPatch
 
         static void EnsureStarterScript()
         {
-            if (Directory.GetFiles(ScriptsDir, "*.cs", SearchOption.AllDirectories).Length != 0)
+            if (GetCurrentScripts().Count != 0)
                 return;
 
             var starterScriptPath = Path.Combine(ScriptsDir, StarterScriptName);
@@ -320,6 +320,9 @@ public static class DemoTargetPingPatch
                     UnloadScript(loadedPath);
             }
 
+            foreach (var loaded in _loaded.Values)
+                ApplyScriptBindingsToLoadedScript(loaded, config);
+
             if (!config.ScriptsEnabled)
                 return;
 
@@ -409,6 +412,9 @@ public static class DemoTargetPingPatch
 
                     if (key.Equals("error", StringComparison.OrdinalIgnoreCase) && TryParseTomlString(value, out var parsedString))
                         config.ScriptErrors[currentScript] = parsedString;
+
+                    if (TryParseBindingConfigKey(key, out var bindingId) && TryParseTomlString(value, out var parsedBinding))
+                        GetOrCreateScriptBindings(config, currentScript)[bindingId] = parsedBinding;
                 }
             }
 
@@ -427,6 +433,8 @@ public static class DemoTargetPingPatch
                 normalized.ScriptEnabled[script] = config.ScriptEnabled.TryGetValue(script, out var enabled) ? enabled : true;
                 if (config.ScriptErrors.TryGetValue(script, out var error) && !string.IsNullOrWhiteSpace(error))
                     normalized.ScriptErrors[script] = error;
+                if (config.ScriptBindings.TryGetValue(script, out var bindings) && bindings.Count != 0)
+                    normalized.ScriptBindings[script] = new Dictionary<string, string>(bindings, StringComparer.OrdinalIgnoreCase);
             }
 
             return normalized;
@@ -470,6 +478,17 @@ public static class DemoTargetPingPatch
                     sb.Append(EscapeTomlString(error));
                     sb.AppendLine("\"");
                 }
+
+                if (config.ScriptBindings.TryGetValue(script.Key, out var bindings))
+                {
+                    foreach (var binding in bindings.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
+                    {
+                        sb.Append(MakeBindingConfigKey(binding.Key));
+                        sb.Append(" = \"");
+                        sb.Append(EscapeTomlString(binding.Value));
+                        sb.AppendLine("\"");
+                    }
+                }
             }
 
             return sb.ToString();
@@ -491,6 +510,8 @@ public static class DemoTargetPingPatch
                 return;
 
             _config.ScriptErrors.Remove(relativePath);
+            _config.ScriptBindings.Remove(relativePath);
+            ClearBindingEditorState(relativePath);
             _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
             WriteConfigIfChanged(_config);
         }
@@ -525,6 +546,83 @@ public static class DemoTargetPingPatch
             WriteConfigIfChanged(_config);
         }
 
+        internal static string RegisterScriptKeyBinding(string relativePath, string bindingId, string defaultBinding)
+        {
+            lock (_stateLock)
+            {
+                var bindings = GetOrCreateScriptBindings(_config, relativePath);
+                var normalizedDefaultBinding = NormalizeBindingText(defaultBinding);
+
+                if (!bindings.TryGetValue(bindingId, out var configuredBinding))
+                {
+                    configuredBinding = normalizedDefaultBinding;
+                    bindings[bindingId] = configuredBinding;
+                    _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+                    WriteConfigIfChanged(_config);
+                }
+                else
+                {
+                    var normalizedConfiguredBinding = NormalizeBindingText(configuredBinding);
+                    if (!string.Equals(normalizedConfiguredBinding, configuredBinding, StringComparison.Ordinal))
+                    {
+                        configuredBinding = normalizedConfiguredBinding;
+                        bindings[bindingId] = configuredBinding;
+                        _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+                        WriteConfigIfChanged(_config);
+                    }
+                    else
+                    {
+                        configuredBinding = normalizedConfiguredBinding;
+                    }
+                }
+
+                return configuredBinding;
+            }
+        }
+
+        static void SetScriptBinding(string relativePath, string bindingId, string bindingText)
+        {
+            var bindings = GetOrCreateScriptBindings(_config, relativePath);
+            bindings[bindingId] = bindingText;
+            _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+            WriteConfigIfChanged(_config);
+            ApplyScriptBindingsToLoadedScript(relativePath, _config);
+        }
+
+        static IReadOnlyDictionary<string, string> GetScriptBindings(string relativePath)
+        {
+            if (_config.ScriptBindings.TryGetValue(relativePath, out var bindings))
+                return bindings;
+
+            return EmptyBindings.Instance;
+        }
+
+        static IEnumerable<string> GetScriptBindingIds(string relativePath)
+        {
+            if (_config.ScriptBindings.TryGetValue(relativePath, out var bindings))
+            {
+                foreach (var bindingId in bindings.Keys.OrderBy(id => id, StringComparer.OrdinalIgnoreCase))
+                    yield return bindingId;
+            }
+        }
+
+        static void ApplyScriptBindingsToLoadedScript(LoadedScript loadedScript, ScriptEngineConfig config)
+        {
+            if (loadedScript.Mod == null)
+                return;
+
+            if (!config.ScriptBindings.TryGetValue(loadedScript.RelativePath, out var bindings))
+                bindings = EmptyBindings.Instance;
+
+            loadedScript.Mod.ScriptEngineApplyKeyBindings(bindings);
+        }
+
+        static void ApplyScriptBindingsToLoadedScript(string relativePath, ScriptEngineConfig config)
+        {
+            foreach (var loadedScript in _loaded.Values.Where(script => string.Equals(script.RelativePath, relativePath, StringComparison.OrdinalIgnoreCase)))
+                ApplyScriptBindingsToLoadedScript(loadedScript, config);
+        }
+
         static void DrawWindow(int windowId)
         {
             RuntimeGui.BeginVertical();
@@ -548,8 +646,13 @@ public static class DemoTargetPingPatch
                     if (nextEnabled != script.Value)
                         SetScriptEnabled(script.Key, nextEnabled);
 
+                    foreach (var bindingId in GetScriptBindingIds(script.Key))
+                        DrawBindingEditor(script.Key, bindingId);
+
                     if (_config.ScriptErrors.TryGetValue(script.Key, out var error) && !string.IsNullOrWhiteSpace(error))
                         RuntimeGui.Label($"error: {error.Replace("\r", "").Replace("\n", " | ")}");
+
+                    RuntimeGui.Space(6f);
                 }
 
                 RuntimeGui.EndScrollView();
@@ -557,6 +660,45 @@ public static class DemoTargetPingPatch
 
             RuntimeGui.EndVertical();
             RuntimeGui.DragWindow(0f, 0f, 10000f, 24f);
+        }
+
+        static void DrawBindingEditor(string relativePath, string bindingId)
+        {
+            var editorKey = MakeBindingEditorKey(relativePath, bindingId);
+            var currentBindings = GetScriptBindings(relativePath);
+            var currentBinding = currentBindings.TryGetValue(bindingId, out var configuredBinding)
+                ? configuredBinding
+                : "";
+            if (!_bindingEditorText.TryGetValue(editorKey, out var pendingBinding) || string.Equals(pendingBinding, currentBinding, StringComparison.Ordinal))
+                pendingBinding = currentBinding;
+
+            RuntimeGui.Label(bindingId);
+            var nextPendingBinding = RuntimeGui.TextField(pendingBinding);
+            if (!string.Equals(nextPendingBinding, pendingBinding, StringComparison.Ordinal))
+                _bindingEditorText[editorKey] = nextPendingBinding;
+            else if (!_bindingEditorText.ContainsKey(editorKey))
+                _bindingEditorText[editorKey] = pendingBinding;
+
+            pendingBinding = _bindingEditorText[editorKey];
+
+            if (string.Equals(pendingBinding, currentBinding, StringComparison.Ordinal))
+                return;
+
+            if (!TryNormalizeBindingText(pendingBinding, out var normalizedBinding, out var error))
+            {
+                RuntimeGui.Label($"invalid: {error}");
+                return;
+            }
+
+            if (RuntimeGui.Button("Apply"))
+            {
+                SetScriptBinding(relativePath, bindingId, normalizedBinding);
+                _bindingEditorText[editorKey] = normalizedBinding;
+                return;
+            }
+
+            if (RuntimeGui.Button("Reset"))
+                _bindingEditorText[editorKey] = currentBinding;
         }
 
         static bool ShouldLoadScript(string relativePath) => ShouldLoadScript(relativePath, _config);
@@ -586,6 +728,57 @@ public static class DemoTargetPingPatch
             result = false;
             return false;
         }
+
+        static bool TryNormalizeBindingText(string? bindingText, out string normalizedBinding, out string error) =>
+            InputRuntime.TryParseBindingText(bindingText, out _, out normalizedBinding, out error);
+
+        static string NormalizeBindingText(string? bindingText) =>
+            TryNormalizeBindingText(bindingText, out var normalizedBinding, out _)
+                ? normalizedBinding
+                : "";
+
+        static Dictionary<string, string> GetOrCreateScriptBindings(ScriptEngineConfig config, string relativePath)
+        {
+            if (!config.ScriptBindings.TryGetValue(relativePath, out var bindings))
+            {
+                bindings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                config.ScriptBindings[relativePath] = bindings;
+            }
+
+            return bindings;
+        }
+
+        static bool TryParseBindingConfigKey(string key, out string bindingId)
+        {
+            bindingId = "";
+            if (TryParseTomlString(key, out var parsedKey))
+                key = parsedKey;
+
+            if (!key.StartsWith("key", StringComparison.OrdinalIgnoreCase) || key.Length <= 3)
+                return false;
+
+            bindingId = key.Substring(3);
+            return !string.IsNullOrWhiteSpace(bindingId);
+        }
+
+        static string MakeBindingConfigKey(string bindingId)
+        {
+            var key = $"key{bindingId}";
+            return IsSimpleTomlKey(key)
+                ? key
+                : $"\"{EscapeTomlString(key)}\"";
+        }
+
+        static string MakeBindingEditorKey(string relativePath, string bindingId) => $"{relativePath}\n{bindingId}";
+
+        static void ClearBindingEditorState(string relativePath)
+        {
+            foreach (var key in _bindingEditorText.Keys.Where(key => key.StartsWith(relativePath + "\n", StringComparison.OrdinalIgnoreCase)).ToList())
+                _bindingEditorText.Remove(key);
+        }
+
+        static bool IsSimpleTomlKey(string key) =>
+            key.All(ch => char.IsLetterOrDigit(ch) || ch == '_' || ch == '-');
 
         static string EscapeTomlString(string value) =>
             value
@@ -742,6 +935,17 @@ public static class DemoTargetPingPatch
         public bool ScriptsEnabled = true;
         public Dictionary<string, bool> ScriptEnabled = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> ScriptErrors = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, Dictionary<string, string>> ScriptBindings = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    sealed class EmptyBindings : Dictionary<string, string>
+    {
+        public static readonly EmptyBindings Instance = new();
+
+        EmptyBindings()
+            : base(StringComparer.OrdinalIgnoreCase)
+        {
+        }
     }
 
     static class RuntimeGui
@@ -765,6 +969,8 @@ public static class DemoTargetPingPatch
         static MethodInfo? _label;
         static MethodInfo? _space;
         static MethodInfo? _toggle;
+        static MethodInfo? _textField;
+        static MethodInfo? _button;
         static MethodInfo? _beginScrollView;
         static MethodInfo? _endScrollView;
         static Array? _emptyLayoutOptions;
@@ -847,6 +1053,18 @@ public static class DemoTargetPingPatch
             return (bool)_toggle!.Invoke(null, new object[] { value, text, _emptyLayoutOptions! })!;
         }
 
+        public static string TextField(string text)
+        {
+            EnsureInitializedOrThrow();
+            return (string)_textField!.Invoke(null, new object[] { text, _emptyLayoutOptions! })!;
+        }
+
+        public static bool Button(string text)
+        {
+            EnsureInitializedOrThrow();
+            return (bool)_button!.Invoke(null, new object[] { text, _emptyLayoutOptions! })!;
+        }
+
         public static object BeginScrollView(object scrollPosition)
         {
             EnsureInitializedOrThrow();
@@ -912,6 +1130,16 @@ public static class DemoTargetPingPatch
                         && m.GetParameters()[0].ParameterType == typeof(bool)
                         && m.GetParameters()[1].ParameterType == typeof(string)
                         && m.GetParameters()[2].ParameterType.IsArray);
+                _textField = _guiLayoutType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "TextField"
+                        && m.GetParameters().Length == 2
+                        && m.GetParameters()[0].ParameterType == typeof(string)
+                        && m.GetParameters()[1].ParameterType.IsArray);
+                _button = _guiLayoutType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "Button"
+                        && m.GetParameters().Length == 2
+                        && m.GetParameters()[0].ParameterType == typeof(string)
+                        && m.GetParameters()[1].ParameterType.IsArray);
                 _beginScrollView = _guiLayoutType.GetMethods(BindingFlags.Public | BindingFlags.Static)
                     .FirstOrDefault(m => m.Name == "BeginScrollView"
                         && m.GetParameters().Length == 2
@@ -919,7 +1147,7 @@ public static class DemoTargetPingPatch
                         && m.GetParameters()[1].ParameterType.IsArray);
                 _endScrollView = _guiLayoutType.GetMethod("EndScrollView", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
 
-                if (_inputGetKeyDown == null || _guiDepthProperty == null || _guiWindow == null || _guiDragWindow == null || _beginVertical == null || _endVertical == null || _label == null || _space == null || _toggle == null || _beginScrollView == null || _endScrollView == null)
+                if (_inputGetKeyDown == null || _guiDepthProperty == null || _guiWindow == null || _guiDragWindow == null || _beginVertical == null || _endVertical == null || _label == null || _space == null || _toggle == null || _textField == null || _button == null || _beginScrollView == null || _endScrollView == null)
                     return false;
 
                 _windowFunctionType = _guiWindow.GetParameters()[2].ParameterType;

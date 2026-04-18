@@ -1,52 +1,57 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using MelonLoader;
 
 namespace ScriptEngine
 {
+    internal sealed class ScriptInitContext
+    {
+        public string ScriptId = "";
+        public ScriptLog Log = null!;
+        public object GameObject = null!;
+        public Action<string, Exception> RuntimeExceptionHandler = null!;
+        public Func<string, string, string> BindingRegistrar = null!;
+    }
+
     public abstract class ScriptModBase
     {
-        ScriptLog? _log;
-        object? _gameObject;
-        Action<string, Exception>? _runtimeExceptionHandler;
+        [ThreadStatic]
+        internal static ScriptInitContext? PendingInit;
 
-        public string ScriptPath { get; private set; } = "";
-        public string RelativePath { get; private set; } = "";
+        ScriptLog _log;
+        protected object _gameObject;
+        Action<string, Exception> _runtimeExceptionHandler;
+        internal ScriptKeyBindings _keys;
 
-        protected object gameObjectObject =>
-            _gameObject ?? throw new InvalidOperationException("Script host GameObject is not available.");
+        public string ScriptId { get; }
 
-        internal void ScriptEngineInitialize(string scriptPath, string relativePath, ScriptLog log, object gameObject, Action<string, Exception> runtimeExceptionHandler)
+        protected ScriptModBase()
         {
-            ScriptPath = scriptPath;
-            RelativePath = relativePath;
-            _log = log;
-            _gameObject = gameObject;
-            _runtimeExceptionHandler = runtimeExceptionHandler;
+            var ctx = PendingInit ?? throw new InvalidOperationException("ScriptModBase must be instantiated by the ScriptEngine.");
+            ScriptId = ctx.ScriptId;
+            _log = ctx.Log;
+            _gameObject = ctx.GameObject;
+            _runtimeExceptionHandler = ctx.RuntimeExceptionHandler;
+            _keys = new ScriptKeyBindings(ctx.BindingRegistrar);
         }
 
         internal void ScriptEngineClearHostObject()
         {
-            _gameObject = null;
+            _gameObject = null!;
         }
 
-        public void Log(string message)
+        internal void ScriptEngineApplyKeyBindings(IReadOnlyDictionary<string, string> bindings)
         {
-            if (_log != null)
-                _log.Info(message);
+            _keys.ScriptEngineApplyBindings(bindings);
         }
 
-        public void Warn(string message)
-        {
-            if (_log != null)
-                _log.Warn(message);
-        }
+        public void Log(string message) => _log.Info(message);
+        public void Warn(string message) => _log.Warn(message);
+        public void Error(string message) => _log.Error(message);
 
-        public void Error(string message)
-        {
-            if (_log != null)
-                _log.Error(message);
-        }
+        public void BindKey(string id, string defaultBinding) => _keys.Register(id, defaultBinding);
+        public bool WasPressed(string id) => _keys.WasPressed(id);
 
         protected virtual void OnEnable() { }
         protected virtual void OnDisable() { }
@@ -70,8 +75,80 @@ namespace ScriptEngine
             }
             catch (Exception ex)
             {
-                _runtimeExceptionHandler?.Invoke(callbackName, ex);
+                _runtimeExceptionHandler(callbackName, ex);
             }
+        }
+    }
+
+    internal sealed class ScriptKeyBindings
+    {
+        readonly Dictionary<string, ScriptKeyBinding> _bindings = new(StringComparer.OrdinalIgnoreCase);
+        readonly Func<string, string, string> _bindingRegistrar;
+
+        internal ScriptKeyBindings(Func<string, string, string> bindingRegistrar)
+        {
+            _bindingRegistrar = bindingRegistrar;
+        }
+
+        internal void ScriptEngineApplyBindings(IReadOnlyDictionary<string, string> bindings)
+        {
+            foreach (var binding in _bindings.Values)
+            {
+                var activeBinding = bindings.GetValueOrDefault(binding.Id, binding.DefaultBindingText);
+                binding.ScriptEngineSetBinding(activeBinding, binding.DefaultBindingText);
+            }
+        }
+
+        internal IReadOnlyCollection<ScriptKeyBinding> ScriptEngineGetBindings() => _bindings.Values;
+
+        internal void Register(string id, string defaultBinding)
+        {
+            if (string.IsNullOrWhiteSpace(id))
+                throw new ArgumentException("Binding id cannot be null or empty.", nameof(id));
+
+            defaultBinding ??= "";
+            var activeBinding = _bindingRegistrar(id, defaultBinding);
+
+            if (!_bindings.TryGetValue(id, out var binding))
+            {
+                binding = new ScriptKeyBinding(id);
+                _bindings.Add(id, binding);
+            }
+
+            binding.ScriptEngineSetBinding(activeBinding, defaultBinding);
+        }
+
+        internal bool WasPressed(string id)
+        {
+            if (_bindings.TryGetValue(id, out var binding))
+                return binding.WasPressedThisFrame;
+            throw new KeyNotFoundException($"Script key binding '{id}' has not been registered.");
+        }
+    }
+
+    internal sealed class ScriptKeyBinding
+    {
+        ScriptKeyChord _chord;
+
+        internal ScriptKeyBinding(string id)
+        {
+            Id = id;
+            DefaultBindingText = "";
+            _chord = ScriptKeyChord.Unbound;
+        }
+
+        public string Id { get; }
+        public string DefaultBindingText { get; private set; }
+
+        public bool WasPressedThisFrame => _chord.WasPressedThisFrame();
+
+        internal void ScriptEngineSetBinding(string bindingText, string defaultBindingText)
+        {
+            DefaultBindingText = defaultBindingText ?? "";
+            if (!InputRuntime.TryParseBindingText(bindingText, out var chord, out _, out _))
+                chord = ScriptKeyChord.Unbound;
+
+            _chord = chord;
         }
     }
 
