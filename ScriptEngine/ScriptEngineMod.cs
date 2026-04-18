@@ -8,8 +8,6 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using MelonLoader;
 using MelonLoader.Utils;
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CSharp;
 
 [assembly: MelonInfo(typeof(ScriptEngine.ScriptEngineMod), "ScriptEngine", "1.0.0", "Dimava")]
 [assembly: MelonGame()]
@@ -25,53 +23,27 @@ namespace ScriptEngine
         const string StarterScriptName = "HelloWorld.cs";
         const string StarterScriptContents =
 @"using HarmonyLib;
-using MelonLoader;
+using ScriptEngine;
 using UnityEngine;
 
-public static class HelloWorld
-{
-    static readonly Harmony Harmony = new(""scriptengine.helloworld"");
-    static GameObject? _gameObject;
-
-    public static void OnLoad()
-    {
-        MelonLogger.Msg(""Hello from ScriptEngine!"");
-
-        if (_gameObject != null)
-            GameObject.Destroy(_gameObject);
-
-        _gameObject = new GameObject(""__ScriptEngineHelloWorld__"");
-        GameObject.DontDestroyOnLoad(_gameObject);
-        _gameObject.AddComponent<HelloWorldBehaviour>();
-
-        Harmony.UnpatchSelf();
-        Harmony.PatchAll(typeof(HelloWorld).Assembly);
-        DemoTarget.Ping();
-    }
-
-    public static void OnUnload()
-    {
-        Harmony.UnpatchSelf();
-
-        if (_gameObject != null)
-        {
-            GameObject.Destroy(_gameObject);
-            _gameObject = null;
-        }
-    }
-}
-
-public sealed class HelloWorldBehaviour : MonoBehaviour
+[ScriptEntry]
+public sealed class HelloWorld : ScriptMod
 {
     float _nextLogTime;
 
-    void Update()
+    protected override void OnEnable()
+    {
+        Log(""Hello from ScriptEngine!"");
+        DemoTarget.Ping();
+    }
+
+    protected override void OnUpdate()
     {
         if (Time.unscaledTime < _nextLogTime)
             return;
 
         _nextLogTime = Time.unscaledTime + 5f;
-        MelonLogger.Msg(""HelloWorldBehaviour.Update()"");
+        Log(""HelloWorld.OnUpdate()"");
     }
 }
 
@@ -79,7 +51,7 @@ public static class DemoTarget
 {
     public static void Ping()
     {
-        MelonLogger.Msg(""DemoTarget.Ping()"");
+        UnityEngine.Debug.Log(""DemoTarget.Ping()"");
     }
 }
 
@@ -88,23 +60,28 @@ public static class DemoTargetPingPatch
 {
     static void Prefix()
     {
-        MelonLogger.Msg(""Harmony prefix before DemoTarget.Ping()"");
+        UnityEngine.Debug.Log(""Harmony prefix before DemoTarget.Ping()"");
     }
 }";
 
-        // track loaded scripts: file path -> (assembly, onUnload action)
         static readonly Dictionary<string, LoadedScript> _loaded = new(StringComparer.OrdinalIgnoreCase);
+        static readonly Dictionary<ScriptKind, IScriptLoader> _loaders = new()
+        {
+            [ScriptKind.LegacyStatic] = new LegacyStaticScriptLoader(),
+            [ScriptKind.Attribute] = new AttributeScriptLoader(),
+        };
         static readonly object _stateLock = new();
         static readonly Regex ScriptSectionRegex = new(@"^\[scripts\.""((?:\\.|[^""])*)""\]\s*$", RegexOptions.Compiled);
         static readonly Dictionary<string, Timer> _debounce = new(StringComparer.OrdinalIgnoreCase);
         static Timer? _configDebounce;
-        static DateTime _ignoreConfigEventsUntilUtc = DateTime.MinValue;
+        static string? _ignoredConfigContents;
         static bool _showUi;
         static object? _windowRect;
         static object? _scrollPosition;
         static FileSystemWatcher _watcher = null!;
         static FileSystemWatcher _configWatcher = null!;
         static ScriptEngineConfig _config = new();
+        static ScriptCompiler _compiler = null!;
 
         public override void OnUpdate()
         {
@@ -132,13 +109,15 @@ public static class DemoTargetPingPatch
             ScriptsDir = Path.Combine(GameDir, "Scripts");
             ConfigPath = Path.Combine(ScriptsDir, ConfigFileName);
             Directory.CreateDirectory(ScriptsDir);
+            ScriptLog.ResetSessionLogs(ScriptsDir);
             EnsureStarterScript();
+            _compiler = new ScriptCompiler();
+
             lock (_stateLock)
                 ReloadConfigFromDiskAndApply();
 
             LoggerInstance.Msg($"ScriptEngine watching: {ScriptsDir}");
 
-            // Watch for changes
             _watcher = new FileSystemWatcher(ScriptsDir, "*.cs")
             {
                 NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.CreationTime,
@@ -174,10 +153,11 @@ public static class DemoTargetPingPatch
             File.WriteAllText(starterScriptPath, StarterScriptContents);
         }
 
-        // Debounce: FSW fires multiple events per save
         static void OnFileEvent(object _, FileSystemEventArgs e)
         {
-            if (_debounce.TryGetValue(e.FullPath, out var t)) t.Dispose();
+            if (_debounce.TryGetValue(e.FullPath, out var timer))
+                timer.Dispose();
+
             _debounce[e.FullPath] = new Timer(_ =>
             {
                 _debounce.Remove(e.FullPath);
@@ -203,7 +183,7 @@ public static class DemoTargetPingPatch
             if (!IsConfigPath(e.FullPath))
                 return;
 
-            if (ShouldIgnoreConfigEvent())
+            if (ShouldIgnoreConfigEvent(e.FullPath))
                 return;
 
             DebounceConfigReload();
@@ -214,14 +194,34 @@ public static class DemoTargetPingPatch
             if (!IsConfigPath(e.OldFullPath) && !IsConfigPath(e.FullPath))
                 return;
 
-            if (ShouldIgnoreConfigEvent())
+            if (ShouldIgnoreConfigEvent(e.FullPath))
                 return;
 
             DebounceConfigReload();
         }
 
-        static bool ShouldIgnoreConfigEvent() =>
-            DateTime.UtcNow <= _ignoreConfigEventsUntilUtc;
+        static bool ShouldIgnoreConfigEvent(string path)
+        {
+            if (string.IsNullOrEmpty(_ignoredConfigContents))
+                return false;
+
+            if (!IsConfigPath(path) || !File.Exists(path))
+                return false;
+
+            try
+            {
+                var currentContents = File.ReadAllText(path);
+                if (string.Equals(currentContents, _ignoredConfigContents, StringComparison.Ordinal))
+                    return true;
+
+                _ignoredConfigContents = null;
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
 
         static void DebounceConfigReload()
         {
@@ -241,6 +241,14 @@ public static class DemoTargetPingPatch
             if (!TryGetRelativeScriptPath(path, out var relativePath))
                 return;
 
+            var currentScripts = GetCurrentScripts();
+            if (!currentScripts.TryGetValue(relativePath, out var script))
+            {
+                UnloadScript(path);
+                RemoveScriptConfigEntry(relativePath);
+                return;
+            }
+
             EnsureScriptConfigEntry(relativePath, enabled: true);
             if (!ShouldLoadScript(relativePath))
             {
@@ -250,7 +258,7 @@ public static class DemoTargetPingPatch
             }
 
             MelonLogger.Msg($"[ScriptEngine] Reloading: {relativePath}");
-            LoadScript(path);
+            LoadScript(script);
         }
 
         static void HandleScriptDeleted(string path)
@@ -275,6 +283,10 @@ public static class DemoTargetPingPatch
             if (newRelativePath == null)
                 return;
 
+            var currentScripts = GetCurrentScripts();
+            if (!currentScripts.TryGetValue(newRelativePath, out var script))
+                return;
+
             EnsureScriptConfigEntry(newRelativePath, enabled: true, overwrite: true);
             if (!ShouldLoadScript(newRelativePath))
             {
@@ -283,7 +295,7 @@ public static class DemoTargetPingPatch
             }
 
             MelonLogger.Msg($"[ScriptEngine] Reloading: {newRelativePath}");
-            LoadScript(newPath);
+            LoadScript(script);
         }
 
         static void ReloadConfigFromDiskAndApply()
@@ -297,49 +309,35 @@ public static class DemoTargetPingPatch
             ApplyConfigToRuntime(normalizedConfig, currentScripts);
         }
 
-        static void ApplyConfigToRuntime(ScriptEngineConfig config, Dictionary<string, string> currentScripts)
+        static void ApplyConfigToRuntime(ScriptEngineConfig config, Dictionary<string, DiscoveredScript> currentScripts)
         {
             foreach (var loadedPath in _loaded.Keys.ToList())
             {
-                if (!TryGetRelativeScriptPath(loadedPath, out var relativePath))
-                {
-                    UnloadScript(loadedPath);
+                if (!_loaded.TryGetValue(loadedPath, out var loaded))
                     continue;
-                }
 
-                if (!currentScripts.ContainsKey(relativePath) || !ShouldLoadScript(relativePath, config))
+                if (!currentScripts.ContainsKey(loaded.RelativePath) || !ShouldLoadScript(loaded.RelativePath, config))
                     UnloadScript(loadedPath);
             }
 
             if (!config.ScriptsEnabled)
                 return;
 
-            foreach (var script in currentScripts.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
+            foreach (var script in currentScripts.Values.OrderBy(s => s.RelativePath, StringComparer.OrdinalIgnoreCase))
             {
-                if (!ShouldLoadScript(script.Key, config))
+                if (!ShouldLoadScript(script.RelativePath, config))
                     continue;
 
-                if (_loaded.ContainsKey(script.Value))
+                if (_loaded.ContainsKey(script.FullPath))
                     continue;
 
-                MelonLogger.Msg($"[ScriptEngine] Loading enabled script: {script.Key}");
-                LoadScript(script.Value);
+                MelonLogger.Msg($"[ScriptEngine] Loading enabled script: {script.RelativePath}");
+                LoadScript(script);
             }
         }
 
-        static Dictionary<string, string> GetCurrentScripts()
-        {
-            var scripts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var file in Directory.GetFiles(ScriptsDir, "*.cs", SearchOption.AllDirectories))
-            {
-                if (!TryGetRelativeScriptPath(file, out var relativePath))
-                    continue;
-
-                scripts[relativePath] = Path.GetFullPath(file);
-            }
-
-            return scripts;
-        }
+        static Dictionary<string, DiscoveredScript> GetCurrentScripts() =>
+            ScriptDiscovery.GetCurrentScripts(ScriptsDir);
 
         static ScriptEngineConfig ReadConfigFromDisk()
         {
@@ -447,7 +445,7 @@ public static class DemoTargetPingPatch
             if (string.Equals(currentContents, contents, StringComparison.Ordinal))
                 return;
 
-            _ignoreConfigEventsUntilUtc = DateTime.UtcNow.AddSeconds(1);
+            _ignoredConfigContents = contents;
             File.WriteAllText(ConfigPath, contents);
         }
 
@@ -492,6 +490,7 @@ public static class DemoTargetPingPatch
             if (!_config.ScriptEnabled.Remove(relativePath))
                 return;
 
+            _config.ScriptErrors.Remove(relativePath);
             _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
             WriteConfigIfChanged(_config);
         }
@@ -507,6 +506,9 @@ public static class DemoTargetPingPatch
         static void SetScriptEnabled(string relativePath, bool enabled)
         {
             _config.ScriptEnabled[relativePath] = enabled;
+            if (enabled)
+                _config.ScriptErrors.Remove(relativePath);
+
             _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
             WriteConfigIfChanged(_config);
             ApplyConfigToRuntime(_config, GetCurrentScripts());
@@ -570,21 +572,8 @@ public static class DemoTargetPingPatch
             return enabled;
         }
 
-        static bool TryGetRelativeScriptPath(string path, out string relativePath)
-        {
-            relativePath = "";
-
-            if (!path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            var fullPath = Path.GetFullPath(path);
-            var relative = Path.GetRelativePath(ScriptsDir, fullPath);
-            if (relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative))
-                return false;
-
-            relativePath = relative.Replace('\\', '/');
-            return true;
-        }
+        static bool TryGetRelativeScriptPath(string path, out string relativePath) =>
+            ScriptDiscovery.TryGetRelativeScriptPath(ScriptsDir, path, out relativePath);
 
         static bool IsConfigPath(string path) =>
             string.Equals(Path.GetFullPath(path), Path.GetFullPath(ConfigPath), StringComparison.OrdinalIgnoreCase);
@@ -684,120 +673,60 @@ public static class DemoTargetPingPatch
             return value;
         }
 
-        static void LoadScript(string path)
+        static void LoadScript(DiscoveredScript script)
         {
-            path = Path.GetFullPath(path);
+            var fullPath = Path.GetFullPath(script.FullPath);
+            UnloadScript(fullPath);
 
-            // Unload previous version first
-            UnloadScript(path);
-
-            string source;
-            try { source = File.ReadAllText(path); }
-            catch (Exception ex) { MelonLogger.Error($"[ScriptEngine] Read failed {Path.GetFileName(path)}: {ex.Message}"); return; }
-
-            var assembly = Compile(path, source);
-            if (assembly == null) return;
-
-            if (TryGetRelativeScriptPath(path, out var relativePath))
-                SetScriptError(relativePath, null);
-
-            // Find and call OnLoad() on any public static class that has it
-            Action? onUnload = null;
-            foreach (var type in assembly.GetTypes())
+            var log = ScriptLog.ForScript(ScriptsDir, script.RelativePath);
+            var assembly = _compiler.Compile(script, log, out var compileError);
+            if (assembly == null)
             {
-                var onLoad = type.GetMethod("OnLoad", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
-                if (onLoad != null)
-                {
-                    try { onLoad.Invoke(null, null); }
-                    catch (Exception ex) { MelonLogger.Error($"[ScriptEngine] OnLoad error in {type.Name}: {ex}"); }
-                }
-
-                var onUnloadMethod = type.GetMethod("OnUnload", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
-                if (onUnloadMethod != null)
-                    onUnload += () => { try { onUnloadMethod.Invoke(null, null); } catch { } };
+                SetScriptError(script.RelativePath, compileError);
+                return;
             }
 
-            _loaded[path] = new LoadedScript(assembly, onUnload);
-            MelonLogger.Msg($"[ScriptEngine] Loaded: {Path.GetFileName(path)}");
+            var loader = _loaders[script.Kind];
+            var loaded = loader.Load(script, assembly, log, HandleScriptRuntimeException, out var loadError);
+            if (loaded == null)
+            {
+                SetScriptError(script.RelativePath, loadError);
+                return;
+            }
+
+            SetScriptError(script.RelativePath, null);
+            _loaded[fullPath] = loaded;
         }
 
         static void UnloadScript(string path)
         {
             path = Path.GetFullPath(path);
-            if (!_loaded.TryGetValue(path, out var script)) return;
-            script.OnUnload?.Invoke();
-            _loaded.Remove(path);
-            MelonLogger.Msg($"[ScriptEngine] Unloaded: {Path.GetFileName(path)}");
+            if (!_loaded.TryGetValue(path, out var script))
+                return;
+
+            try
+            {
+                script.OnUnload?.Invoke();
+            }
+            finally
+            {
+                _loaded.Remove(path);
+            }
         }
 
-        static Assembly? Compile(string path, string source)
+        static void HandleScriptRuntimeException(string relativePath, string callbackName, Exception exception)
         {
-            // Build reference list from all loaded assemblies + game Managed folder
-            var refs = new List<MetadataReference>();
-
-            // All currently loaded assemblies
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            lock (_stateLock)
             {
-                try
-                {
-                    if (!string.IsNullOrEmpty(asm.Location))
-                        refs.Add(MetadataReference.CreateFromFile(asm.Location));
-                }
-                catch { }
+                var loaded = _loaded.Values.FirstOrDefault(script => string.Equals(script.RelativePath, relativePath, StringComparison.OrdinalIgnoreCase));
+                if (loaded == null)
+                    return;
+
+                loaded.Log.Error($"Unhandled {callbackName} exception: {exception}");
+                loaded.Log.Warn("Disabling script after runtime exception.");
+                SetScriptError(relativePath, exception.ToString());
+                SetScriptEnabled(relativePath, false);
             }
-
-            // Also add everything in Managed/ that isn't already loaded
-            var managedDir = MelonEnvironment.UnityGameManagedDirectory;
-            if (Directory.Exists(managedDir))
-            {
-                var loadedPaths = new HashSet<string>(
-                    AppDomain.CurrentDomain.GetAssemblies()
-                        .Select(a => a.Location)
-                        .Where(l => !string.IsNullOrEmpty(l))
-                        .Select(Path.GetFullPath),
-                    StringComparer.OrdinalIgnoreCase);
-
-                foreach (var dll in Directory.GetFiles(managedDir, "*.dll"))
-                {
-                    if (!loadedPaths.Contains(Path.GetFullPath(dll)))
-                        try { refs.Add(MetadataReference.CreateFromFile(dll)); } catch { }
-                }
-            }
-
-            var tree = CSharpSyntaxTree.ParseText(source, path: path);
-            var options = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
-                optimizationLevel: OptimizationLevel.Debug,
-                allowUnsafe: true);
-
-            var compilation = CSharpCompilation.Create(
-                assemblyName: Path.GetFileNameWithoutExtension(path) + "_" + DateTime.Now.Ticks,
-                syntaxTrees: new[] { tree },
-                references: refs,
-                options: options);
-
-            using var ms = new MemoryStream();
-            var result = compilation.Emit(ms);
-
-            var logPath = Path.ChangeExtension(path, ".log");
-
-            if (!result.Success)
-            {
-                var errors = result.Diagnostics
-                    .Where(d => d.Severity == DiagnosticSeverity.Error)
-                    .Select(d => $"{d.GetMessage()} ({d.Location.GetLineSpan().StartLinePosition})");
-                var errorText = string.Join("\n", errors);
-                MelonLogger.Error($"[ScriptEngine] Compile errors in {Path.GetFileName(path)}:\n  {errorText.Replace("\n", "\n  ")}");
-                File.WriteAllText(logPath, $"Compile errors in {Path.GetFileName(path)}:\n{errorText}\n");
-                if (TryGetRelativeScriptPath(path, out var relativePath))
-                    SetScriptError(relativePath, errorText);
-                return null;
-            }
-
-            // Clear stale log on success
-            if (File.Exists(logPath)) File.Delete(logPath);
-
-            ms.Seek(0, SeekOrigin.Begin);
-            return Assembly.Load(ms.ToArray());
         }
     }
 
@@ -813,13 +742,6 @@ public static class DemoTargetPingPatch
         public bool ScriptsEnabled = true;
         public Dictionary<string, bool> ScriptEnabled = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> ScriptErrors = new(StringComparer.OrdinalIgnoreCase);
-    }
-
-    class LoadedScript
-    {
-        public Assembly Assembly;
-        public Action? OnUnload;
-        public LoadedScript(Assembly assembly, Action? onUnload) { Assembly = assembly; OnUnload = onUnload; }
     }
 
     static class RuntimeGui

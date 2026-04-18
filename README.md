@@ -4,7 +4,7 @@ A universal MelonLoader mod that hot-reloads C# scripts at runtime — no game r
 
 Drop a `.cs` file into the `Scripts/` folder, save it, and it compiles and runs within 300ms.
 
-On first launch, ScriptEngine creates `Scripts/HelloWorld.cs` automatically if the folder has no scripts yet. The sample includes a persistent `GameObject` with an `Update()` loop and a minimal Harmony patch.
+On first launch, ScriptEngine creates `Scripts/HelloWorld.cs` automatically if the folder has no scripts yet. The sample uses the new `[ScriptEntry]` + `ScriptMod` API.
 
 ## How it works
 
@@ -12,9 +12,9 @@ ScriptEngine uses [Roslyn](https://github.com/dotnet/roslyn) to compile `.cs` fi
 
 On save:
 1. `FileSystemWatcher` detects the change (debounced 300ms)
-2. Previous version's `OnUnload()` is called
+2. Previous version is unloaded
 3. Roslyn compiles the file in-memory
-4. New assembly is loaded and `OnLoad()` is called
+4. New assembly is loaded through either the legacy static loader or the new `[ScriptEntry]` loader
 
 ## Installation
 
@@ -42,6 +42,14 @@ If you are building from source, package the release files with `.\scripts\packa
 
 Place `.cs` files in `<GameDir>/Scripts/`. ScriptEngine scans that folder on startup and watches for changes.
 
+Discovery rules:
+
+- New-style scripts are `.cs` files with exactly one `[ScriptEntry]` class deriving from `ScriptMod`
+- Legacy scripts are `.cs` files with public static `OnLoad()` / `OnUnload()` hooks
+- Other `.cs` files are ignored
+- Directories whose name starts with `.` are ignored
+- `bin`, `obj`, and `node_modules` are ignored
+
 ScriptEngine also maintains `<GameDir>/Scripts/ScriptEngine.cfg` to control which scripts are allowed to load:
 
 ```toml
@@ -63,8 +71,54 @@ error = "The name \"Foo\" does not exist in the current context (12,8)"
 - Editing `ScriptEngine.cfg` while the game is running applies immediately
 - Press `F8` in-game to open a simple ScriptEngine window with a global toggle and per-script toggles
 - `error` is engine-managed and cleared automatically after a successful compile
+- Runtime callback exceptions disable the script and write the exception into `error`
+- Per-script logs are written to `Scripts/logs/<relative-script-path>.log`
+- The `Scripts/logs/` session logs are reset on game launch, not on hot-reload
 
-Your script can be any valid C# file. ScriptEngine finds and calls these two static methods if present:
+## New-style scripts
+
+Recommended format:
+
+```csharp
+using HarmonyLib;
+using ScriptEngine;
+
+[ScriptEntry]
+public sealed class Hello : ScriptMod
+{
+    protected override void OnEnable()
+    {
+        Log("Hello!");
+    }
+
+    protected override void OnUpdate()
+    {
+        // runs every frame
+    }
+}
+```
+
+Available `ScriptMod` lifecycle methods:
+
+- `OnEnable`
+- `OnDisable`
+- `OnUpdate`
+- `OnFixedUpdate`
+- `OnLateUpdate`
+- `OnGUI`
+
+`ScriptMod` also exposes:
+
+- `gameObject`
+- `Log(string)`
+- `Warn(string)`
+- `Error(string)`
+
+Harmony patches are applied automatically for new-style scripts. Any `[HarmonyPatch]` type in the script file's compiled assembly is patched on load and unpatched on unload.
+
+## Legacy scripts
+
+The old static loader still works during transition. ScriptEngine finds and calls these two static methods if present:
 
 ```csharp
 public static void OnLoad()   { /* called after compile / hot-reload */ }
@@ -73,53 +127,7 @@ public static void OnUnload() { /* called before reload or on file delete */ }
 
 All game types, UnityEngine, MelonLoader, and Harmony are available without any imports beyond `using` directives.
 
-### Minimal example
-
-```csharp
-using MelonLoader;
-
-public static class Hello
-{
-    public static void OnLoad() => MelonLogger.Msg("Hello!");
-}
-```
-
-### Per-frame update (MonoBehaviour)
-
-Scripts don't get `Update()` directly. Attach a `MonoBehaviour` to a persistent `GameObject`:
-
-```csharp
-using MelonLoader;
-using UnityEngine;
-
-public static class MyScript
-{
-    static GameObject? _go;
-
-    public static void OnLoad()
-    {
-        if (_go != null) GameObject.Destroy(_go);
-        _go = new GameObject("__MyScript__");
-        GameObject.DontDestroyOnLoad(_go);
-        _go.AddComponent<MyBehaviour>();
-    }
-
-    public static void OnUnload()
-    {
-        if (_go != null) { GameObject.Destroy(_go); _go = null; }
-    }
-}
-
-public class MyBehaviour : MonoBehaviour
-{
-    void Update()
-    {
-        // runs every frame
-    }
-}
-```
-
-### Harmony patches
+### Legacy Harmony example
 
 ```csharp
 using HarmonyLib;
@@ -188,6 +196,9 @@ For local development, you can hard-link the current build output into the game'
 ```
 ScriptEngine/
   ScriptEngine.csproj   — project file, references MelonLoader + Roslyn
-  ScriptEngineMod.cs    — the mod: FSW, compiler, loader
+  ScriptEngineMod.cs    — the mod: FSW, config, UI
+  ScriptLoaders.cs      — discovery, compiler, legacy/new loaders
+  ScriptApi.cs          — shared script base and per-script log sink
+  ScriptRuntime.cs      — reflection wrappers for Unity/Harmony host integration
   README.md
 ```
