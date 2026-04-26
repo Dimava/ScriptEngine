@@ -9,7 +9,7 @@ using System.Threading;
 using MelonLoader;
 using MelonLoader.Utils;
 
-[assembly: MelonInfo(typeof(ScriptEngine.ScriptEngineMod), "ScriptEngine", "1.0.0", "Dimava")]
+[assembly: MelonInfo(typeof(ScriptEngine.ScriptEngineMod), "ScriptEngine", "1.1.0", "Dimava")]
 [assembly: MelonGame()]
 
 namespace ScriptEngine
@@ -71,6 +71,8 @@ public static class DemoTargetPingPatch
             [ScriptKind.Attribute] = new AttributeScriptLoader(),
         };
         static readonly object _stateLock = new();
+        static readonly object _mainThreadActionLock = new();
+        static readonly Queue<Action> _mainThreadActions = new();
         static readonly Regex ScriptSectionRegex = new(@"^\[scripts\.""((?:\\.|[^""])*)""\]\s*$", RegexOptions.Compiled);
         static readonly Dictionary<string, Timer> _debounce = new(StringComparer.OrdinalIgnoreCase);
         static readonly Dictionary<string, string> _bindingEditorText = new(StringComparer.OrdinalIgnoreCase);
@@ -86,8 +88,40 @@ public static class DemoTargetPingPatch
 
         public override void OnUpdate()
         {
+            ProcessMainThreadActions();
+
             if (RuntimeGui.GetKeyDown("F8"))
                 _showUi = !_showUi;
+        }
+
+        static void EnqueueMainThreadAction(Action action)
+        {
+            lock (_mainThreadActionLock)
+                _mainThreadActions.Enqueue(action);
+        }
+
+        static void ProcessMainThreadActions()
+        {
+            while (true)
+            {
+                Action action;
+                lock (_mainThreadActionLock)
+                {
+                    if (_mainThreadActions.Count == 0)
+                        return;
+
+                    action = _mainThreadActions.Dequeue();
+                }
+
+                try
+                {
+                    action();
+                }
+                catch (Exception ex)
+                {
+                    MelonLogger.Error($"[ScriptEngine] Main-thread action failed: {ex}");
+                }
+            }
         }
 
         public override void OnGUI()
@@ -210,32 +244,45 @@ public static class DemoTargetPingPatch
         {
             lock (_stateLock)
             {
-                UnloadScript(e.FullPath);
-
                 if (_debounce.TryGetValue(e.FullPath, out var timer))
                     timer.Dispose();
 
-                _debounce[e.FullPath] = new Timer(_ =>
+                Timer? debounceTimer = null;
+                debounceTimer = new Timer(_ =>
                 {
-                    lock (_stateLock)
+                    EnqueueMainThreadAction(() =>
                     {
-                        _debounce.Remove(e.FullPath);
-                        HandleScriptChanged(e.FullPath);
-                    }
+                        lock (_stateLock)
+                        {
+                            if (!_debounce.TryGetValue(e.FullPath, out var activeTimer) || !ReferenceEquals(activeTimer, debounceTimer))
+                                return;
+
+                            _debounce.Remove(e.FullPath);
+                            HandleScriptChanged(e.FullPath);
+                        }
+                    });
                 }, null, 300, Timeout.Infinite);
+
+                _debounce[e.FullPath] = debounceTimer;
             }
         }
 
         static void OnFileDeleted(object _, FileSystemEventArgs e)
         {
-            lock (_stateLock)
-                HandleScriptDeleted(e.FullPath);
+            EnqueueMainThreadAction(() =>
+            {
+                lock (_stateLock)
+                    HandleScriptDeleted(e.FullPath);
+            });
         }
 
         static void OnFileRenamed(object _, RenamedEventArgs e)
         {
-            lock (_stateLock)
-                HandleScriptRenamed(e.OldFullPath, e.FullPath);
+            EnqueueMainThreadAction(() =>
+            {
+                lock (_stateLock)
+                    HandleScriptRenamed(e.OldFullPath, e.FullPath);
+            });
         }
 
         static void OnConfigEvent(object _, FileSystemEventArgs e)
@@ -288,8 +335,11 @@ public static class DemoTargetPingPatch
             _configDebounce?.Dispose();
             _configDebounce = new Timer(_ =>
             {
-                lock (_stateLock)
-                    ReloadConfigFromDiskAndApply();
+                EnqueueMainThreadAction(() =>
+                {
+                    lock (_stateLock)
+                        ReloadConfigFromDiskAndApply();
+                });
             }, null, 300, Timeout.Infinite);
         }
 
@@ -309,7 +359,7 @@ public static class DemoTargetPingPatch
                 return;
             }
 
-            EnsureScriptConfigEntry(relativePath, enabled: true);
+            EnsureScriptConfigEntry(relativePath, enabled: _config.EnableNewScripts);
             if (!ShouldLoadScript(relativePath))
             {
                 UnloadScript(path);
@@ -347,7 +397,7 @@ public static class DemoTargetPingPatch
             if (!currentScripts.TryGetValue(newRelativePath, out var script))
                 return;
 
-            EnsureScriptConfigEntry(newRelativePath, enabled: true, overwrite: true);
+            EnsureScriptConfigEntry(newRelativePath, enabled: _config.EnableNewScripts, overwrite: true);
             if (!ShouldLoadScript(newRelativePath))
             {
                 MelonLogger.Msg($"[ScriptEngine] Ignoring disabled script: {newRelativePath}");
@@ -476,6 +526,15 @@ public static class DemoTargetPingPatch
                     continue;
                 }
 
+                if (currentSection == ConfigSection.ScriptsRoot && key.Equals("enableNewScripts", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!TryParseBool(value, out var parsedBool))
+                        continue;
+
+                    config.EnableNewScripts = parsedBool;
+                    continue;
+                }
+
                 if (currentSection == ConfigSection.Script && currentScript != null)
                 {
                     if (key.Equals("enabled", StringComparison.OrdinalIgnoreCase))
@@ -509,11 +568,12 @@ public static class DemoTargetPingPatch
             var normalized = new ScriptEngineConfig
             {
                 ScriptsEnabled = config.ScriptsEnabled,
+                EnableNewScripts = config.EnableNewScripts,
             };
 
             foreach (var script in currentScripts.OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
             {
-                normalized.ScriptEnabled[script] = config.ScriptEnabled.TryGetValue(script, out var enabled) ? enabled : true;
+                normalized.ScriptEnabled[script] = config.ScriptEnabled.TryGetValue(script, out var enabled) ? enabled : config.EnableNewScripts;
                 if (config.ScriptErrors.TryGetValue(script, out var error) && !string.IsNullOrWhiteSpace(error))
                     normalized.ScriptErrors[script] = error;
                 if (config.ScriptValues.TryGetValue(script, out var values) && values.Count != 0)
@@ -548,6 +608,8 @@ public static class DemoTargetPingPatch
             sb.AppendLine("[scripts]");
             sb.Append("enabled = ");
             sb.AppendLine(config.ScriptsEnabled ? "true" : "false");
+            sb.Append("enableNewScripts = ");
+            sb.AppendLine(config.EnableNewScripts ? "true" : "false");
 
             foreach (var script in config.ScriptEnabled.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
             {
@@ -632,6 +694,17 @@ public static class DemoTargetPingPatch
                 _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
                 WriteConfigIfChanged(_config);
                 ApplyConfigToRuntime(_config, GetCurrentScripts());
+                UpdateModRecords(GetCurrentScripts());
+            }
+        }
+
+        public static void SetEnableNewScripts(bool enabled)
+        {
+            lock (_stateLock)
+            {
+                _config.EnableNewScripts = enabled;
+                _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+                WriteConfigIfChanged(_config);
                 UpdateModRecords(GetCurrentScripts());
             }
         }
@@ -830,6 +903,11 @@ public static class DemoTargetPingPatch
                 if (nextScriptsEnabled != scriptsEnabled)
                     SetScriptsEnabled(nextScriptsEnabled);
 
+                bool enableNewScripts = _config.EnableNewScripts;
+                bool nextEnableNewScripts = RuntimeGui.Toggle(enableNewScripts, "Enable new scripts");
+                if (nextEnableNewScripts != enableNewScripts)
+                    SetEnableNewScripts(nextEnableNewScripts);
+
                 _scrollPosition = RuntimeGui.BeginScrollView(_scrollPosition!);
                 foreach (var script in _config.ScriptEnabled.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase).ToList())
                 {
@@ -900,7 +978,7 @@ public static class DemoTargetPingPatch
                 return false;
 
             if (!config.ScriptEnabled.TryGetValue(relativePath, out var enabled))
-                return true;
+                return config.EnableNewScripts;
 
             return enabled;
         }
@@ -1183,6 +1261,7 @@ public static class DemoTargetPingPatch
     public class ScriptEngineConfig
     {
         public bool ScriptsEnabled = true;
+        public bool EnableNewScripts = true;
         public Dictionary<string, bool> ScriptEnabled = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> ScriptErrors = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, Dictionary<string, string>> ScriptValues = new(StringComparer.OrdinalIgnoreCase);
