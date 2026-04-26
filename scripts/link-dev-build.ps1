@@ -1,19 +1,19 @@
 <#
 .SYNOPSIS
-Links the current ScriptEngine build output into a game's Mods and UserLibs folders.
+Links the current ScriptEngine build output into a BepInEx game's plugin folder.
 
 .DESCRIPTION
 Creates hard links for ScriptEngine.dll and its runtime dependencies from the local
-build output into the target game's Mods and UserLibs directories.
+build output into BepInEx\plugins\ScriptEngine under the target game directory.
 
 .PARAMETER GamePath
-Path to the target MelonLoader game root directory.
+Path to the target BepInEx game root directory.
 
 .PARAMETER Configuration
 Build configuration to link from. Defaults to Release.
 
 .PARAMETER Watch
-If set, watches for changes to ScriptEngine.dll and rebuilds + relinks automatically.
+If set, watches for changes to ScriptEngine sources and rebuilds + relinks automatically.
 
 .EXAMPLE
 .\link-dev-build.ps1 -GamePath "C:\Games\MyGame"
@@ -33,24 +33,38 @@ param(
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $gameRoot = (Resolve-Path $GamePath).Path
 $outputDir = Join-Path $projectRoot "ScriptEngine\bin\$Configuration\netstandard2.1"
-$modsDir = Join-Path $gameRoot "Mods"
-$userLibsDir = Join-Path $gameRoot "UserLibs"
+$pluginDir = Join-Path $gameRoot "BepInEx\plugins\ScriptEngine"
 
 $files = @(
-    @{ Source = Join-Path $outputDir "ScriptEngine.dll"; Target = Join-Path $modsDir "ScriptEngine.dll" },
-    @{ Source = Join-Path $outputDir "Microsoft.CodeAnalysis.dll"; Target = Join-Path $userLibsDir "Microsoft.CodeAnalysis.dll" },
-    @{ Source = Join-Path $outputDir "Microsoft.CodeAnalysis.CSharp.dll"; Target = Join-Path $userLibsDir "Microsoft.CodeAnalysis.CSharp.dll" },
-    @{ Source = Join-Path $outputDir "System.Collections.Immutable.dll"; Target = Join-Path $userLibsDir "System.Collections.Immutable.dll" },
-    @{ Source = Join-Path $outputDir "System.Reflection.Metadata.dll"; Target = Join-Path $userLibsDir "System.Reflection.Metadata.dll" },
-    @{ Source = Join-Path $outputDir "System.Memory.dll"; Target = Join-Path $userLibsDir "System.Memory.dll" },
-    @{ Source = Join-Path $outputDir "System.Buffers.dll"; Target = Join-Path $userLibsDir "System.Buffers.dll" },
-    @{ Source = Join-Path $outputDir "System.Numerics.Vectors.dll"; Target = Join-Path $userLibsDir "System.Numerics.Vectors.dll" },
-    @{ Source = Join-Path $outputDir "System.Runtime.CompilerServices.Unsafe.dll"; Target = Join-Path $userLibsDir "System.Runtime.CompilerServices.Unsafe.dll" },
-    @{ Source = Join-Path $outputDir "System.Text.Encoding.CodePages.dll"; Target = Join-Path $userLibsDir "System.Text.Encoding.CodePages.dll" },
-    @{ Source = Join-Path $outputDir "System.Threading.Tasks.Extensions.dll"; Target = Join-Path $userLibsDir "System.Threading.Tasks.Extensions.dll" }
-)
+    "ScriptEngine.dll",
+    "ScriptEngine.pdb",
+    "ScriptEngine.deps.json",
+    "Microsoft.CodeAnalysis.dll",
+    "Microsoft.CodeAnalysis.CSharp.dll",
+    "System.Buffers.dll",
+    "System.Collections.Immutable.dll",
+    "System.Collections.NonGeneric.dll",
+    "System.Collections.Specialized.dll",
+    "System.ComponentModel.dll",
+    "System.ComponentModel.Primitives.dll",
+    "System.ComponentModel.TypeConverter.dll",
+    "System.IO.FileSystem.Primitives.dll",
+    "System.Linq.dll",
+    "System.Memory.dll",
+    "System.Numerics.Vectors.dll",
+    "System.Reflection.Metadata.dll",
+    "System.Reflection.TypeExtensions.dll",
+    "System.Runtime.CompilerServices.Unsafe.dll",
+    "System.Text.Encoding.CodePages.dll",
+    "System.Threading.dll",
+    "System.Threading.Tasks.Extensions.dll"
+).ForEach({
+    @{ Source = Join-Path $outputDir $_; Target = Join-Path $pluginDir $_ }
+})
 
 function Invoke-Link {
+    New-Item -ItemType Directory -Force -Path $pluginDir | Out-Null
+
     foreach ($file in $files) {
         if (-not (Test-Path $file.Source)) {
             Write-Warning "Missing build output: $($file.Source). Run the build first."
@@ -64,7 +78,7 @@ function Invoke-Link {
         New-Item -ItemType HardLink -Path $file.Target -Target $file.Source | Out-Null
     }
 
-    Write-Host "Linked dev build into $modsDir and $userLibsDir"
+    Write-Host "Linked dev build into $pluginDir"
     return $true
 }
 

@@ -1,15 +1,28 @@
 <#
 .SYNOPSIS
-Builds and packages a ScriptEngine release zip for a target MelonLoader game.
+Builds all ScriptEngine release zip variants.
 
 .DESCRIPTION
-Runs restore, build, and release packaging for ScriptEngine.
+Restores/builds ScriptEngine once, then creates all release zips in this
+repository's release directory:
+
+- ScriptEngine-<version>.zip
+- ScriptEngine-<version>-scripts.zip
+- ScriptEngine-<version>-bepinex.zip
+- ScriptEngine-<version>-scripts-bepinex.zip
 
 .PARAMETER Version
-Version label used in the release folder and zip file name.
+Version label used in zip file names. Defaults to the Version property from
+ScriptEngine.csproj.
 
 .PARAMETER Configuration
 Build configuration to use. Defaults to Release.
+
+.PARAMETER ScriptsDir
+Source Scripts directory used for script-inclusive packages.
+
+.PARAMETER BepInExVersion
+BepInEx 5 win x64 version to include. Defaults to latest.
 
 .PARAMETER SkipRestore
 Skips dotnet restore before building.
@@ -18,14 +31,20 @@ Skips dotnet restore before building.
 Skips dotnet build and packages the current output directory as-is.
 
 .EXAMPLE
-.\package-release.ps1 -Version 1.0.0
+.\package-release.ps1 -ScriptsDir "C:\Games\Modulus\Scripts"
 #>
 param(
     [Parameter(Mandatory = $false)]
-    [string]$Version = "1.1.1",
+    [string]$Version = "",
 
     [Parameter(Mandatory = $false)]
     [string]$Configuration = "Release",
+
+    [Parameter(Mandatory = $false)]
+    [string]$ScriptsDir = "",
+
+    [Parameter(Mandatory = $false)]
+    [string]$BepInExVersion = "latest",
 
     [Parameter(Mandatory = $false)]
     [switch]$SkipRestore,
@@ -34,11 +53,25 @@ param(
     [switch]$SkipBuild
 )
 
+$ErrorActionPreference = "Stop"
+
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$workspaceRoot = Split-Path -Parent $projectRoot
 $projectFile = Join-Path $projectRoot "ScriptEngine\ScriptEngine.csproj"
-$outputDir = Join-Path $projectRoot "ScriptEngine\bin\$Configuration\netstandard2.1"
-$packageRoot = Join-Path $projectRoot "release\ScriptEngine-$Version"
-$zipPath = Join-Path $projectRoot "release\ScriptEngine-$Version.zip"
+$releaseDir = Join-Path $projectRoot "release"
+$packageScript = Join-Path $PSScriptRoot "package-unzip.ps1"
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    [xml]$projectXml = Get-Content -Raw $projectFile
+    $Version = $projectXml.Project.PropertyGroup.Version | Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        throw "Version property not found in $projectFile."
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($ScriptsDir)) {
+    $ScriptsDir = Join-Path $workspaceRoot "Scripts"
+}
 
 if (-not $SkipRestore) {
     & dotnet restore $projectFile
@@ -59,43 +92,38 @@ if (-not $SkipBuild) {
     }
 }
 
-if (-not (Test-Path (Join-Path $outputDir "ScriptEngine.dll"))) {
-    throw "Build output not found in $outputDir."
-}
+New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 
-$dependencies = @(
-    "Microsoft.CodeAnalysis.dll",
-    "Microsoft.CodeAnalysis.CSharp.dll",
-    "System.Collections.Immutable.dll",
-    "System.Reflection.Metadata.dll",
-    "System.Memory.dll",
-    "System.Buffers.dll",
-    "System.Numerics.Vectors.dll",
-    "System.Runtime.CompilerServices.Unsafe.dll",
-    "System.Text.Encoding.CodePages.dll",
-    "System.Threading.Tasks.Extensions.dll"
+$packages = @(
+    @{ Name = "ScriptEngine-$Version"; Scripts = $false; BepInEx = $false },
+    @{ Name = "ScriptEngine-$Version-scripts"; Scripts = $true; BepInEx = $false },
+    @{ Name = "ScriptEngine-$Version-bepinex"; Scripts = $false; BepInEx = $true },
+    @{ Name = "ScriptEngine-$Version-scripts-bepinex"; Scripts = $true; BepInEx = $true }
 )
 
-Remove-Item $packageRoot -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path (Join-Path $packageRoot "Mods"), (Join-Path $packageRoot "UserLibs") | Out-Null
-
-Copy-Item (Join-Path $outputDir "ScriptEngine.dll") (Join-Path $packageRoot "Mods\")
-
-foreach ($dependency in $dependencies) {
-    $source = Join-Path $outputDir $dependency
-    if (-not (Test-Path $source)) {
-        throw "Missing dependency '$dependency' in $outputDir."
+foreach ($package in $packages) {
+    $packageArgs = @{
+        Version = $Version
+        Configuration = $Configuration
+        SkipRestore = $true
+        SkipBuild = $true
+        PackageName = $package.Name
     }
 
-    Copy-Item $source (Join-Path $packageRoot "UserLibs\")
+    if ($package.Scripts) {
+        $packageArgs.IncludeScripts = $true
+        $packageArgs.ScriptsDir = $ScriptsDir
+    }
+
+    if ($package.BepInEx) {
+        $packageArgs.IncludeBepInEx = $true
+        $packageArgs.BepInExVersion = $BepInExVersion
+    }
+
+    & $packageScript @packageArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "package-unzip.ps1 failed for $($package.Name)."
+    }
 }
 
-Compress-Archive -Path (Join-Path $packageRoot "*") -DestinationPath $zipPath
-Write-Host "Created $zipPath"
-
-$unzipPackageScript = Join-Path $PSScriptRoot "package-unzip.ps1"
-& $unzipPackageScript -Version $Version -Configuration $Configuration -SkipRestore -SkipBuild
-if ($LASTEXITCODE -ne 0) {
-    throw "package-unzip.ps1 failed."
-}
+Write-Host "Created all ScriptEngine $Version release zips in $releaseDir"

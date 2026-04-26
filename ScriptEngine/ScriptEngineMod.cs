@@ -6,16 +6,15 @@ using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
-using MelonLoader;
-using MelonLoader.Utils;
-
-[assembly: MelonInfo(typeof(ScriptEngine.ScriptEngineMod), "ScriptEngine", "1.1.1", "Dimava")]
-[assembly: MelonGame()]
+using BepInEx;
+using BepInEx.Logging;
 
 namespace ScriptEngine
 {
-    public class ScriptEngineMod : MelonMod
+    [BepInPlugin("dev.dimava.modulus.scriptengine", "ScriptEngine", MyPluginInfo.PLUGIN_VERSION)]
+    public class ScriptEngineMod : BaseUnityPlugin
     {
+        internal static ManualLogSource? LogSource;
         static string ScriptsDir = null!;
         static string GameDir = null!;
         static string ConfigPath = null!;
@@ -86,7 +85,7 @@ public static class DemoTargetPingPatch
         static ScriptEngineConfig _config = new();
         static ScriptCompiler _compiler = null!;
 
-        public override void OnUpdate()
+        void Update()
         {
             ProcessMainThreadActions();
 
@@ -119,12 +118,12 @@ public static class DemoTargetPingPatch
                 }
                 catch (Exception ex)
                 {
-                    MelonLogger.Error($"[ScriptEngine] Main-thread action failed: {ex}");
+                    ScriptEngineLog.Error($"[ScriptEngine] Main-thread action failed: {ex}");
                 }
             }
         }
 
-        public override void OnGUI()
+        void OnGUI()
         {
             if (!_showUi)
                 return;
@@ -190,9 +189,10 @@ public static class DemoTargetPingPatch
                 loaded?.Mod);
         }
 
-        public override void OnInitializeMelon()
+        void Awake()
         {
-            GameDir = MelonEnvironment.GameRootDirectory;
+            LogSource = Logger;
+            GameDir = Paths.GameRootPath;
             ScriptsDir = Path.Combine(GameDir, "Scripts");
             ConfigPath = Path.Combine(ScriptsDir, ConfigFileName);
             Directory.CreateDirectory(ScriptsDir);
@@ -203,7 +203,7 @@ public static class DemoTargetPingPatch
             lock (_stateLock)
                 ReloadConfigFromDiskAndApply();
 
-            LoggerInstance.Msg($"ScriptEngine watching: {ScriptsDir}");
+            ScriptEngineLog.Msg($"ScriptEngine watching: {ScriptsDir}");
 
             _watcher = new FileSystemWatcher(ScriptsDir, "*.cs")
             {
@@ -226,6 +226,19 @@ public static class DemoTargetPingPatch
             _configWatcher.Created += OnConfigEvent;
             _configWatcher.Deleted += OnConfigEvent;
             _configWatcher.Renamed += OnConfigRenamed;
+        }
+
+        void OnDestroy()
+        {
+            _watcher?.Dispose();
+            _configWatcher?.Dispose();
+
+            foreach (var loadedPath in _loaded.Keys.ToList())
+                UnloadScript(loadedPath);
+
+            _configDebounce?.Dispose();
+            foreach (var timer in _debounce.Values)
+                timer.Dispose();
         }
 
         static void EnsureStarterScript()
@@ -363,11 +376,11 @@ public static class DemoTargetPingPatch
             if (!ShouldLoadScript(relativePath))
             {
                 UnloadScript(path);
-                MelonLogger.Msg($"[ScriptEngine] Ignoring disabled script: {relativePath}");
+                ScriptEngineLog.Msg($"[ScriptEngine] Ignoring disabled script: {relativePath}");
                 return;
             }
 
-            MelonLogger.Msg($"[ScriptEngine] Reloading: {relativePath}");
+            ScriptEngineLog.Msg($"[ScriptEngine] Reloading: {relativePath}");
             LoadScript(script);
         }
 
@@ -400,11 +413,11 @@ public static class DemoTargetPingPatch
             EnsureScriptConfigEntry(newRelativePath, enabled: _config.EnableNewScripts, overwrite: true);
             if (!ShouldLoadScript(newRelativePath))
             {
-                MelonLogger.Msg($"[ScriptEngine] Ignoring disabled script: {newRelativePath}");
+                ScriptEngineLog.Msg($"[ScriptEngine] Ignoring disabled script: {newRelativePath}");
                 return;
             }
 
-            MelonLogger.Msg($"[ScriptEngine] Reloading: {newRelativePath}");
+            ScriptEngineLog.Msg($"[ScriptEngine] Reloading: {newRelativePath}");
             LoadScript(script);
         }
 
@@ -452,7 +465,7 @@ public static class DemoTargetPingPatch
                 if (_loaded.ContainsKey(script.FullPath))
                     continue;
 
-                MelonLogger.Msg($"[ScriptEngine] Loading enabled script: {script.RelativePath}");
+                ScriptEngineLog.Msg($"[ScriptEngine] Loading enabled script: {script.RelativePath}");
                 LoadScript(script);
             }
 
@@ -482,7 +495,7 @@ public static class DemoTargetPingPatch
             }
             catch (Exception ex)
             {
-                MelonLogger.Error($"[ScriptEngine] Failed to read {ConfigFileName}: {ex.Message}");
+                ScriptEngineLog.Error($"[ScriptEngine] Failed to read {ConfigFileName}: {ex.Message}");
                 return config;
             }
 
@@ -1510,7 +1523,7 @@ public static class DemoTargetPingPatch
             {
                 if (!_loggedInitializationFailure)
                 {
-                    MelonLogger.Error($"[ScriptEngine] Failed to initialize IMGUI bridge: {ex.Message}");
+                    ScriptEngineLog.Error($"[ScriptEngine] Failed to initialize IMGUI bridge: {ex.Message}");
                     _loggedInitializationFailure = true;
                 }
 
@@ -1532,6 +1545,24 @@ public static class DemoTargetPingPatch
             }
 
             return null;
+        }
+    }
+
+    internal static class ScriptEngineLog
+    {
+        public static void Msg(string message) => Write(LogLevel.Info, message);
+        public static void Warning(string message) => Write(LogLevel.Warning, message);
+        public static void Error(string message) => Write(LogLevel.Error, message);
+
+        static void Write(LogLevel level, string message)
+        {
+            if (ScriptEngineMod.LogSource != null)
+            {
+                ScriptEngineMod.LogSource.Log(level, message);
+                return;
+            }
+
+            Console.WriteLine(message);
         }
     }
 }

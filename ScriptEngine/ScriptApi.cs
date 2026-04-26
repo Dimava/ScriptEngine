@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using MelonLoader;
 
 namespace ScriptEngine
 {
@@ -363,7 +362,7 @@ namespace ScriptEngine
             }
             catch (Exception ex)
             {
-                MelonLogger.Warning($"[ScriptEngine] Failed to reset session logs: {ex.Message}");
+                ScriptEngineLog.Warning($"[ScriptEngine] Failed to reset session logs: {ex.Message}");
             }
 
             _globalErrorLogPath = Path.Combine(logsDir, "errors.log");
@@ -376,14 +375,14 @@ namespace ScriptEngine
             return new ScriptLog(relativePath, logPath);
         }
 
-        public void Info(string message) => Write("Info", message, MelonLogger.Msg, global: false);
-        public void Warn(string message) => Write("Warn", message, MelonLogger.Warning, global: false);
-        public void Error(string message) => Write("Error", message, MelonLogger.Error, global: true);
+        public void Info(string message) => Write("Info", message, ScriptEngineLog.Msg, global: false);
+        public void Warn(string message) => Write("Warn", message, ScriptEngineLog.Warning, global: false);
+        public void Error(string message) => Write("Error", message, ScriptEngineLog.Error, global: true);
 
-        void Write(string level, string message, Action<string> melonWrite, bool global)
+        void Write(string level, string message, Action<string> hostWrite, bool global)
         {
             var formatted = $"[{DateTime.Now:HH:mm:ss.fff}] [{level}] {message}";
-            melonWrite($"[{_relativePath}] {message}");
+            hostWrite($"[{_relativePath}] {message}");
 
             lock (WriteLock)
             {
@@ -405,7 +404,7 @@ namespace ScriptEngine
             }
             catch (Exception ex)
             {
-                MelonLogger.Warning($"[ScriptEngine] Failed to write log: {ex.Message}");
+                ScriptEngineLog.Warning($"[ScriptEngine] Failed to write log: {ex.Message}");
             }
         }
     }

@@ -279,14 +279,14 @@ namespace ScriptEngine
                 catch { }
             }
 
-            var managedDir = MelonLoader.Utils.MelonEnvironment.UnityGameManagedDirectory;
+            var managedDir = BepInEx.Paths.ManagedPath;
             if (Directory.Exists(managedDir))
             {
                 var loadedPaths = new HashSet<string>(
                     AppDomain.CurrentDomain.GetAssemblies()
-                        .Select(a => a.Location)
+                        .Select(TryGetAssemblyLocation)
                         .Where(l => !string.IsNullOrEmpty(l))
-                        .Select(Path.GetFullPath),
+                        .Select(l => Path.GetFullPath(l!)),
                     StringComparer.OrdinalIgnoreCase);
 
                 foreach (var dll in Directory.GetFiles(managedDir, "*.dll"))
@@ -300,6 +300,18 @@ namespace ScriptEngine
             }
 
             return refs;
+        }
+
+        static string? TryGetAssemblyLocation(Assembly assembly)
+        {
+            try
+            {
+                return assembly.Location;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         static void DeleteLegacyCompileLog(string scriptPath)

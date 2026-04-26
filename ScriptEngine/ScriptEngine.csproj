@@ -5,24 +5,25 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>ScriptEngine</AssemblyName>
-    <Version>1.1.1</Version>
+    <Version>1.2.0</Version>
     <Authors>Dimava</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/Dimava/ScriptEngine</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <!-- Copy NuGet package DLLs (Roslyn) to output -->
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <NoWarn>$(NoWarn);NU1701</NoWarn>
+    <RestoreAdditionalProjectSources>
+      https://api.nuget.org/v3/index.json;
+      https://nuget.bepinex.dev/v3/index.json;
+      https://nuget.samboy.dev/v3/index.json
+    </RestoreAdditionalProjectSources>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="LavaGang.MelonLoader" Version="0.7.2" GeneratePathProperty="true" PrivateAssets="all" />
-    <!-- MelonLoader compile reference from the official NuGet package -->
-    <Reference Include="MelonLoader">
-      <HintPath>$(PkgLavaGang_MelonLoader)\lib\net35\MelonLoader.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <!-- Roslyn C# compiler (runtime compilation) -->
+    <PackageReference Include="BepInEx.Analyzers" Version="1.*" PrivateAssets="all" />
+    <PackageReference Include="BepInEx.Core" Version="5.*" />
+    <PackageReference Include="BepInEx.PluginInfoProps" Version="2.*" PrivateAssets="all" />
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.8.0" />
+    <PackageReference Include="UnityEngine.Modules" Version="6000.0.61" IncludeAssets="compile" />
   </ItemGroup>
 </Project>
