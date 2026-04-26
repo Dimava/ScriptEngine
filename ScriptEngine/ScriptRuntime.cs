@@ -135,7 +135,7 @@ namespace ScriptEngine
         }
     }
 
-    internal readonly struct ScriptKeyChord
+    public readonly struct ScriptKeyChord
     {
         public static readonly ScriptKeyChord Unbound = new(ctrl: false, shift: false, alt: false, keyCode: null);
 
@@ -171,7 +171,7 @@ namespace ScriptEngine
         }
     }
 
-    internal static class InputRuntime
+    public static class InputRuntime
     {
         static readonly Dictionary<string, string> KeyAliases = new(StringComparer.OrdinalIgnoreCase)
         {

@@ -366,6 +366,8 @@ namespace ScriptEngine
                     GameObject = gameObject,
                     RuntimeExceptionHandler = (callbackName, ex) => runtimeExceptionHandler(script.RelativePath, callbackName, ex),
                     BindingRegistrar = (bindingId, defaultBinding) => ScriptEngineMod.RegisterScriptKeyBinding(script.RelativePath, bindingId, defaultBinding),
+                    ConfigRegistrar = (configId, defaultValue) => ScriptEngineMod.RegisterScriptConfigValue(script.RelativePath, configId, defaultValue),
+                    ConfigSetter = (configId, rawValue) => ScriptEngineMod.SetScriptConfigValue(script.RelativePath, configId, rawValue),
                 };
                 try
                 {

@@ -1,30 +1,91 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using MelonLoader;
 
 namespace ScriptEngine
 {
-    internal sealed class ScriptInitContext
+    public sealed class ScriptInitContext
     {
         public string ScriptId = "";
         public ScriptLog Log = null!;
         public object GameObject = null!;
         public Action<string, Exception> RuntimeExceptionHandler = null!;
         public Func<string, string, string> BindingRegistrar = null!;
+        public Func<string, string, string> ConfigRegistrar = null!;
+        public Action<string, string> ConfigSetter = null!;
+    }
+
+    public delegate bool TryParseConfigValue<T>(string text, out T value);
+
+    public sealed class ScriptConfigEntry<T>
+    {
+        readonly TryParseConfigValue<T> _tryParse;
+        readonly Func<T, string> _format;
+        readonly Action<ScriptConfigEntry<T>> _onChanged;
+        string _rawValue;
+
+        public ScriptConfigEntry(
+            string id,
+            string rawValue,
+            T defaultValue,
+            TryParseConfigValue<T> tryParse,
+            Func<T, string> format,
+            Action<ScriptConfigEntry<T>> onChanged)
+        {
+            Id = id;
+            _rawValue = rawValue;
+            DefaultValue = defaultValue;
+            _tryParse = tryParse;
+            _format = format;
+            _onChanged = onChanged;
+        }
+
+        public string Id { get; }
+        public T DefaultValue { get; }
+
+        public string RawValue
+        {
+            get => _rawValue;
+            set
+            {
+                if (string.Equals(_rawValue, value, StringComparison.Ordinal))
+                    return;
+
+                _rawValue = value;
+                _onChanged(this);
+            }
+        }
+
+        public T Value
+        {
+            get
+            {
+                if (_tryParse(_rawValue, out var value))
+                    return value;
+
+                Value = DefaultValue;
+                return DefaultValue;
+            }
+            set => RawValue = _format(value);
+        }
     }
 
     public abstract class ScriptModBase
     {
         [ThreadStatic]
-        internal static ScriptInitContext? PendingInit;
+        public static ScriptInitContext? PendingInit;
 
         ScriptLog _log;
         protected object _gameObject;
         Action<string, Exception> _runtimeExceptionHandler;
-        internal ScriptKeyBindings _keys;
+        Func<string, string, string> _configRegistrar;
+        Action<string, string> _configSetter;
+        ScriptKeyBindings _keys;
 
         public string ScriptId { get; }
+        public ScriptKeyBindings Keys => _keys;
 
         protected ScriptModBase()
         {
@@ -33,15 +94,17 @@ namespace ScriptEngine
             _log = ctx.Log;
             _gameObject = ctx.GameObject;
             _runtimeExceptionHandler = ctx.RuntimeExceptionHandler;
+            _configRegistrar = ctx.ConfigRegistrar;
+            _configSetter = ctx.ConfigSetter;
             _keys = new ScriptKeyBindings(ctx.BindingRegistrar);
         }
 
-        internal void ScriptEngineClearHostObject()
+        public void ScriptEngineClearHostObject()
         {
             _gameObject = null!;
         }
 
-        internal void ScriptEngineApplyKeyBindings(IReadOnlyDictionary<string, string> bindings)
+        public void ScriptEngineApplyKeyBindings(IReadOnlyDictionary<string, string> bindings)
         {
             _keys.ScriptEngineApplyBindings(bindings);
         }
@@ -52,6 +115,45 @@ namespace ScriptEngine
 
         public void BindKey(string id, string defaultBinding) => _keys.Register(id, defaultBinding);
         public bool WasPressed(string id) => _keys.WasPressed(id);
+
+        public ScriptConfigEntry<int> BindInt(string id, int defaultValue)
+        {
+            var defaultText = defaultValue.ToString(CultureInfo.InvariantCulture);
+            var rawValue = _configRegistrar(id, defaultText);
+            return new ScriptConfigEntry<int>(
+                id,
+                rawValue,
+                defaultValue,
+                static (string text, out int value) => int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value),
+                static value => value.ToString(CultureInfo.InvariantCulture),
+                entry => _configSetter(entry.Id, entry.RawValue));
+        }
+
+        public ScriptConfigEntry<float> BindFloat(string id, float defaultValue)
+        {
+            var defaultText = defaultValue.ToString(CultureInfo.InvariantCulture);
+            var rawValue = _configRegistrar(id, defaultText);
+            return new ScriptConfigEntry<float>(
+                id,
+                rawValue,
+                defaultValue,
+                static (string text, out float value) => float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value),
+                static value => value.ToString(CultureInfo.InvariantCulture),
+                entry => _configSetter(entry.Id, entry.RawValue));
+        }
+
+        public ScriptConfigEntry<bool> BindBool(string id, bool defaultValue)
+        {
+            var defaultText = defaultValue ? "true" : "false";
+            var rawValue = _configRegistrar(id, defaultText);
+            return new ScriptConfigEntry<bool>(
+                id,
+                rawValue,
+                defaultValue,
+                static (string text, out bool value) => bool.TryParse(text, out value),
+                static value => value ? "true" : "false",
+                entry => _configSetter(entry.Id, entry.RawValue));
+        }
 
         protected virtual void OnEnable() { }
         protected virtual void OnDisable() { }
@@ -80,17 +182,17 @@ namespace ScriptEngine
         }
     }
 
-    internal sealed class ScriptKeyBindings
+    public sealed class ScriptKeyBindings
     {
         readonly Dictionary<string, ScriptKeyBinding> _bindings = new(StringComparer.OrdinalIgnoreCase);
         readonly Func<string, string, string> _bindingRegistrar;
 
-        internal ScriptKeyBindings(Func<string, string, string> bindingRegistrar)
+        public ScriptKeyBindings(Func<string, string, string> bindingRegistrar)
         {
             _bindingRegistrar = bindingRegistrar;
         }
 
-        internal void ScriptEngineApplyBindings(IReadOnlyDictionary<string, string> bindings)
+        public void ScriptEngineApplyBindings(IReadOnlyDictionary<string, string> bindings)
         {
             foreach (var binding in _bindings.Values)
             {
@@ -99,9 +201,9 @@ namespace ScriptEngine
             }
         }
 
-        internal IReadOnlyCollection<ScriptKeyBinding> ScriptEngineGetBindings() => _bindings.Values;
+        public IReadOnlyCollection<ScriptKeyBinding> ScriptEngineGetBindings() => _bindings.Values;
 
-        internal void Register(string id, string defaultBinding)
+        public void Register(string id, string defaultBinding)
         {
             if (string.IsNullOrWhiteSpace(id))
                 throw new ArgumentException("Binding id cannot be null or empty.", nameof(id));
@@ -118,7 +220,7 @@ namespace ScriptEngine
             binding.ScriptEngineSetBinding(activeBinding, defaultBinding);
         }
 
-        internal bool WasPressed(string id)
+        public bool WasPressed(string id)
         {
             if (_bindings.TryGetValue(id, out var binding))
                 return binding.WasPressedThisFrame;
@@ -126,11 +228,11 @@ namespace ScriptEngine
         }
     }
 
-    internal sealed class ScriptKeyBinding
+    public sealed class ScriptKeyBinding
     {
         ScriptKeyChord _chord;
 
-        internal ScriptKeyBinding(string id)
+        public ScriptKeyBinding(string id)
         {
             Id = id;
             DefaultBindingText = "";
@@ -142,7 +244,7 @@ namespace ScriptEngine
 
         public bool WasPressedThisFrame => _chord.WasPressedThisFrame();
 
-        internal void ScriptEngineSetBinding(string bindingText, string defaultBindingText)
+        public void ScriptEngineSetBinding(string bindingText, string defaultBindingText)
         {
             DefaultBindingText = defaultBindingText ?? "";
             if (!InputRuntime.TryParseBindingText(bindingText, out var chord, out _, out _))
@@ -152,7 +254,7 @@ namespace ScriptEngine
         }
     }
 
-    internal sealed class ScriptLog
+    public sealed class ScriptLog
     {
         static readonly object WriteLock = new();
         static string? _globalErrorLogPath;
@@ -162,7 +264,7 @@ namespace ScriptEngine
 
         public string LogPath => _logPath;
 
-        ScriptLog(string relativePath, string logPath)
+        public ScriptLog(string relativePath, string logPath)
         {
             _relativePath = relativePath;
             _logPath = logPath;

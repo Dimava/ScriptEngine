@@ -420,8 +420,14 @@ public static class DemoTargetPingPatch
                     if (key.Equals("error", StringComparison.OrdinalIgnoreCase) && TryParseTomlString(value, out var parsedString))
                         config.ScriptErrors[currentScript] = parsedString;
 
-                    if (TryParseBindingConfigKey(key, out var bindingId) && TryParseTomlString(value, out var parsedBinding))
-                        GetOrCreateScriptBindings(config, currentScript)[bindingId] = parsedBinding;
+                    if (TryParseScriptConfigKey(key, out var configId))
+                    {
+                        var rawValue = ParseTomlValueAsRawString(value);
+                        GetOrCreateScriptValues(config, currentScript)[configId] = rawValue;
+
+                        if (TryParseTomlString(value, out var parsedBinding))
+                            GetOrCreateScriptBindings(config, currentScript)[configId] = parsedBinding;
+                    }
                 }
             }
 
@@ -440,6 +446,8 @@ public static class DemoTargetPingPatch
                 normalized.ScriptEnabled[script] = config.ScriptEnabled.TryGetValue(script, out var enabled) ? enabled : true;
                 if (config.ScriptErrors.TryGetValue(script, out var error) && !string.IsNullOrWhiteSpace(error))
                     normalized.ScriptErrors[script] = error;
+                if (config.ScriptValues.TryGetValue(script, out var values) && values.Count != 0)
+                    normalized.ScriptValues[script] = new Dictionary<string, string>(values, StringComparer.OrdinalIgnoreCase);
                 if (config.ScriptBindings.TryGetValue(script, out var bindings) && bindings.Count != 0)
                     normalized.ScriptBindings[script] = new Dictionary<string, string>(bindings, StringComparer.OrdinalIgnoreCase);
             }
@@ -490,10 +498,30 @@ public static class DemoTargetPingPatch
                 {
                     foreach (var binding in bindings.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
                     {
-                        sb.Append(MakeBindingConfigKey(binding.Key));
+                        if (binding.Key.Equals("enabled", StringComparison.OrdinalIgnoreCase)
+                            || binding.Key.Equals("error", StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        sb.Append(MakeConfigKey(binding.Key));
                         sb.Append(" = \"");
                         sb.Append(EscapeTomlString(binding.Value));
                         sb.AppendLine("\"");
+                    }
+                }
+
+                if (config.ScriptValues.TryGetValue(script.Key, out var values))
+                {
+                    foreach (var value in values.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (value.Key.Equals("enabled", StringComparison.OrdinalIgnoreCase)
+                            || value.Key.Equals("error", StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        if (bindings != null && bindings.ContainsKey(value.Key))
+                            continue;
+
+                        sb.Append(MakeConfigKey(value.Key));
+                        sb.Append(" = ");
+                        sb.AppendLine(FormatRawConfigValue(value.Value));
                     }
                 }
             }
@@ -518,6 +546,7 @@ public static class DemoTargetPingPatch
 
             _config.ScriptErrors.Remove(relativePath);
             _config.ScriptBindings.Remove(relativePath);
+            _config.ScriptValues.Remove(relativePath);
             ClearBindingEditorState(relativePath);
             _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
             WriteConfigIfChanged(_config);
@@ -558,12 +587,16 @@ public static class DemoTargetPingPatch
             lock (_stateLock)
             {
                 var bindings = GetOrCreateScriptBindings(_config, relativePath);
+                var values = GetOrCreateScriptValues(_config, relativePath);
                 var normalizedDefaultBinding = NormalizeBindingText(defaultBinding);
 
                 if (!bindings.TryGetValue(bindingId, out var configuredBinding))
                 {
-                    configuredBinding = normalizedDefaultBinding;
+                    configuredBinding = values.TryGetValue(bindingId, out var configuredRawBinding)
+                        ? NormalizeBindingText(configuredRawBinding)
+                        : normalizedDefaultBinding;
                     bindings[bindingId] = configuredBinding;
+                    values[bindingId] = configuredBinding;
                     _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
                     WriteConfigIfChanged(_config);
                 }
@@ -574,6 +607,7 @@ public static class DemoTargetPingPatch
                     {
                         configuredBinding = normalizedConfiguredBinding;
                         bindings[bindingId] = configuredBinding;
+                        values[bindingId] = configuredBinding;
                         _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
                         WriteConfigIfChanged(_config);
                     }
@@ -587,10 +621,59 @@ public static class DemoTargetPingPatch
             }
         }
 
+        internal static string RegisterScriptConfigValue(string relativePath, string configId, string defaultValue)
+        {
+            lock (_stateLock)
+            {
+                if (string.IsNullOrWhiteSpace(configId))
+                    throw new ArgumentException("Config id cannot be null or empty.", nameof(configId));
+
+                if (configId.Equals("enabled", StringComparison.OrdinalIgnoreCase))
+                {
+                    var enabled = _config.ScriptEnabled.TryGetValue(relativePath, out var configuredEnabled)
+                        ? configuredEnabled
+                        : true;
+                    return enabled ? "true" : "false";
+                }
+
+                var values = GetOrCreateScriptValues(_config, relativePath);
+                if (!values.TryGetValue(configId, out var configuredValue))
+                {
+                    configuredValue = defaultValue ?? "";
+                    values[configId] = configuredValue;
+                    _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+                    WriteConfigIfChanged(_config);
+                }
+
+                return configuredValue;
+            }
+        }
+
+        internal static void SetScriptConfigValue(string relativePath, string configId, string rawValue)
+        {
+            lock (_stateLock)
+            {
+                if (string.IsNullOrWhiteSpace(configId))
+                    throw new ArgumentException("Config id cannot be null or empty.", nameof(configId));
+
+                if (configId.Equals("enabled", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (TryParseBool(rawValue, out var enabled))
+                        SetScriptEnabled(relativePath, enabled);
+                    return;
+                }
+
+                GetOrCreateScriptValues(_config, relativePath)[configId] = rawValue ?? "";
+                _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+                WriteConfigIfChanged(_config);
+            }
+        }
+
         static void SetScriptBinding(string relativePath, string bindingId, string bindingText)
         {
             var bindings = GetOrCreateScriptBindings(_config, relativePath);
             bindings[bindingId] = bindingText;
+            GetOrCreateScriptValues(_config, relativePath)[bindingId] = bindingText;
             _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
             WriteConfigIfChanged(_config);
             ApplyScriptBindingsToLoadedScript(relativePath, _config);
@@ -751,9 +834,20 @@ public static class DemoTargetPingPatch
             return bindings;
         }
 
-        static bool TryParseBindingConfigKey(string key, out string bindingId)
+        static Dictionary<string, string> GetOrCreateScriptValues(ScriptEngineConfig config, string relativePath)
         {
-            bindingId = "";
+            if (!config.ScriptValues.TryGetValue(relativePath, out var values))
+            {
+                values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                config.ScriptValues[relativePath] = values;
+            }
+
+            return values;
+        }
+
+        static bool TryParseScriptConfigKey(string key, out string configId)
+        {
+            configId = "";
             if (TryParseTomlString(key, out var parsedKey))
                 key = parsedKey;
 
@@ -764,14 +858,14 @@ public static class DemoTargetPingPatch
             if (string.IsNullOrWhiteSpace(key))
                 return false;
 
-            bindingId = key;
+            configId = key;
             return true;
         }
 
-        static string MakeBindingConfigKey(string bindingId) =>
-            IsSimpleTomlKey(bindingId)
-                ? bindingId
-                : $"\"{EscapeTomlString(bindingId)}\"";
+        static string MakeConfigKey(string configId) =>
+            IsSimpleTomlKey(configId)
+                ? configId
+                : $"\"{EscapeTomlString(configId)}\"";
 
         static string MakeBindingEditorKey(string relativePath, string bindingId) => $"{relativePath}\n{bindingId}";
 
@@ -836,6 +930,25 @@ public static class DemoTargetPingPatch
 
             result = UnescapeTomlString(value.Substring(1, value.Length - 2));
             return true;
+        }
+
+        static string ParseTomlValueAsRawString(string value) =>
+            TryParseTomlString(value, out var parsedString)
+                ? parsedString
+                : value.Trim();
+
+        static string FormatRawConfigValue(string value)
+        {
+            if (bool.TryParse(value, out _))
+                return value.ToLowerInvariant();
+
+            if (int.TryParse(value, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out _))
+                return value;
+
+            if (float.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out _))
+                return value;
+
+            return $"\"{EscapeTomlString(value)}\"";
         }
 
         static string StripTomlInlineComment(string value)
@@ -939,6 +1052,7 @@ public static class DemoTargetPingPatch
         public bool ScriptsEnabled = true;
         public Dictionary<string, bool> ScriptEnabled = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> ScriptErrors = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, Dictionary<string, string>> ScriptValues = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, Dictionary<string, string>> ScriptBindings = new(StringComparer.OrdinalIgnoreCase);
     }
 
