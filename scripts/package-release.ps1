@@ -93,3 +93,9 @@ foreach ($dependency in $dependencies) {
 
 Compress-Archive -Path (Join-Path $packageRoot "*") -DestinationPath $zipPath
 Write-Host "Created $zipPath"
+
+$unzipPackageScript = Join-Path $PSScriptRoot "package-unzip.ps1"
+& $unzipPackageScript -Version $Version -Configuration $Configuration -SkipRestore -SkipBuild
+if ($LASTEXITCODE -ne 0) {
+    throw "package-unzip.ps1 failed."
+}

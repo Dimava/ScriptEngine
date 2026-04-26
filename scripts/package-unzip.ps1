@@ -7,7 +7,7 @@ into the game install directory (no wrapping folder, no MelonLoader payload).
 The resulting zip contains Mods\, UserLibs\, and Scripts\ at its top level.
 MelonLoader itself (and version.dll) is expected to already be installed by the
 user; this script only ships the mod, its managed dependencies, and the
-Scripts/ tree.
+Scripts/Dimava tree plus a default ScriptEngine.cfg.
 
 .PARAMETER Version
 Version label used in the zip file name.
@@ -44,7 +44,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $workspaceRoot = Split-Path -Parent $projectRoot
 $projectFile = Join-Path $projectRoot "ScriptEngine\ScriptEngine.csproj"
 $outputDir = Join-Path $projectRoot "ScriptEngine\bin\$Configuration\netstandard2.1"
-$scriptsSource = Join-Path $workspaceRoot "Scripts"
+$scriptsSource = Join-Path $workspaceRoot "Scripts\Dimava"
 $stagingRoot = Join-Path $workspaceRoot "release\Modulus-ScriptBundle-$Version-unzip"
 $zipPath = Join-Path $workspaceRoot "release\Modulus-ScriptBundle-$Version-unzip.zip"
 
@@ -95,12 +95,22 @@ foreach ($dependency in $dependencies) {
 }
 
 if (-not (Test-Path $scriptsSource)) {
-    throw "Scripts folder not found at $scriptsSource."
+    throw "Scripts\Dimava folder not found at $scriptsSource."
 }
 
 $excludeDirs = @(".git", "bin", "obj", "node_modules", "logs")
-$scriptsDest = Join-Path $stagingRoot "Scripts"
+$scriptsDest = Join-Path $stagingRoot "Scripts\Dimava"
 $sourceFull = (Resolve-Path $scriptsSource).Path.TrimEnd('\')
+
+$defaultConfig = @"
+[scripts]
+enabled = true
+enableNewScripts = false
+
+[scripts."Dimava/+ScriptEngineSettingsTab.cs"]
+enabled = true
+"@
+Set-Content -Path (Join-Path $stagingRoot "Scripts\ScriptEngine.cfg") -Value $defaultConfig -Encoding ASCII
 
 Get-ChildItem -LiteralPath $scriptsSource -Recurse -Force | ForEach-Object {
     $rel = $_.FullName.Substring($sourceFull.Length).TrimStart('\')
