@@ -19,7 +19,15 @@ namespace ScriptEngine
 
     public delegate bool TryParseConfigValue<T>(string text, out T value);
 
+    public interface IScriptConfigEntry
+    {
+        string Id { get; }
+        string RawValue { get; }
+        void ScriptEngineApplyRawValue(string rawValue);
+    }
+
     public sealed class ScriptConfigEntry<T>
+        : IScriptConfigEntry
     {
         readonly TryParseConfigValue<T> _tryParse;
         readonly Func<T, string> _format;
@@ -70,6 +78,11 @@ namespace ScriptEngine
             }
             set => RawValue = _format(value);
         }
+
+        public void ScriptEngineApplyRawValue(string rawValue)
+        {
+            _rawValue = rawValue;
+        }
     }
 
     public abstract class ScriptModBase
@@ -83,6 +96,7 @@ namespace ScriptEngine
         Func<string, string, string> _configRegistrar;
         Action<string, string> _configSetter;
         ScriptKeyBindings _keys;
+        readonly Dictionary<string, IScriptConfigEntry> _configEntries = new(StringComparer.OrdinalIgnoreCase);
 
         public string ScriptId { get; }
         public ScriptKeyBindings Keys => _keys;
@@ -109,6 +123,15 @@ namespace ScriptEngine
             _keys.ScriptEngineApplyBindings(bindings);
         }
 
+        public void ScriptEngineApplyConfigValues(IReadOnlyDictionary<string, string> values)
+        {
+            foreach (var entry in _configEntries.Values)
+            {
+                if (values.TryGetValue(entry.Id, out var rawValue))
+                    entry.ScriptEngineApplyRawValue(rawValue);
+            }
+        }
+
         public void Log(string message) => _log.Info(message);
         public void Warn(string message) => _log.Warn(message);
         public void Error(string message) => _log.Error(message);
@@ -120,43 +143,50 @@ namespace ScriptEngine
         {
             var defaultText = defaultValue.ToString(CultureInfo.InvariantCulture);
             var rawValue = _configRegistrar(id, defaultText);
-            return new ScriptConfigEntry<int>(
+            return RegisterConfigEntry(new ScriptConfigEntry<int>(
                 id,
                 rawValue,
                 defaultValue,
                 static (string text, out int value) => int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value),
                 static value => value.ToString(CultureInfo.InvariantCulture),
-                entry => _configSetter(entry.Id, entry.RawValue));
+                entry => _configSetter(entry.Id, entry.RawValue)));
         }
 
         public ScriptConfigEntry<float> BindFloat(string id, float defaultValue)
         {
             var defaultText = defaultValue.ToString(CultureInfo.InvariantCulture);
             var rawValue = _configRegistrar(id, defaultText);
-            return new ScriptConfigEntry<float>(
+            return RegisterConfigEntry(new ScriptConfigEntry<float>(
                 id,
                 rawValue,
                 defaultValue,
                 static (string text, out float value) => float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value),
                 static value => value.ToString(CultureInfo.InvariantCulture),
-                entry => _configSetter(entry.Id, entry.RawValue));
+                entry => _configSetter(entry.Id, entry.RawValue)));
         }
 
         public ScriptConfigEntry<bool> BindBool(string id, bool defaultValue)
         {
             var defaultText = defaultValue ? "true" : "false";
             var rawValue = _configRegistrar(id, defaultText);
-            return new ScriptConfigEntry<bool>(
+            return RegisterConfigEntry(new ScriptConfigEntry<bool>(
                 id,
                 rawValue,
                 defaultValue,
                 static (string text, out bool value) => bool.TryParse(text, out value),
                 static value => value ? "true" : "false",
-                entry => _configSetter(entry.Id, entry.RawValue));
+                entry => _configSetter(entry.Id, entry.RawValue)));
+        }
+
+        ScriptConfigEntry<T> RegisterConfigEntry<T>(ScriptConfigEntry<T> entry)
+        {
+            _configEntries[entry.Id] = entry;
+            return entry;
         }
 
         protected virtual void OnEnable() { }
         protected virtual void OnDisable() { }
+        protected virtual void OnConfigChanged() { }
         protected virtual void OnUpdate() { }
         protected virtual void OnFixedUpdate() { }
         protected virtual void OnLateUpdate() { }
@@ -164,6 +194,7 @@ namespace ScriptEngine
 
         public void ScriptEngineInvokeEnable() => OnEnable();
         public void ScriptEngineInvokeDisable() => OnDisable();
+        public void ScriptEngineInvokeConfigChanged() => InvokeFrameCallback(nameof(OnConfigChanged), OnConfigChanged);
         public void ScriptEngineInvokeUpdate() => InvokeFrameCallback(nameof(OnUpdate), OnUpdate);
         public void ScriptEngineInvokeFixedUpdate() => InvokeFrameCallback(nameof(OnFixedUpdate), OnFixedUpdate);
         public void ScriptEngineInvokeLateUpdate() => InvokeFrameCallback(nameof(OnLateUpdate), OnLateUpdate);

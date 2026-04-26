@@ -310,13 +310,14 @@ public static class DemoTargetPingPatch
             var currentScripts = GetCurrentScripts();
             var parsedConfig = ReadConfigFromDisk();
             var normalizedConfig = NormalizeConfig(parsedConfig, currentScripts.Keys);
+            var previousConfig = _config;
 
             _config = normalizedConfig;
             WriteConfigIfChanged(normalizedConfig);
-            ApplyConfigToRuntime(normalizedConfig, currentScripts);
+            ApplyConfigToRuntime(normalizedConfig, currentScripts, previousConfig);
         }
 
-        static void ApplyConfigToRuntime(ScriptEngineConfig config, Dictionary<string, DiscoveredScript> currentScripts)
+        static void ApplyConfigToRuntime(ScriptEngineConfig config, Dictionary<string, DiscoveredScript> currentScripts, ScriptEngineConfig? previousConfig = null)
         {
             foreach (var loadedPath in _loaded.Keys.ToList())
             {
@@ -328,7 +329,13 @@ public static class DemoTargetPingPatch
             }
 
             foreach (var loaded in _loaded.Values)
+            {
                 ApplyScriptBindingsToLoadedScript(loaded, config);
+                ApplyScriptConfigToLoadedScript(loaded, config);
+
+                if (previousConfig != null && ScriptConfigValuesChanged(loaded.RelativePath, previousConfig, config))
+                    loaded.Mod?.ScriptEngineInvokeConfigChanged();
+            }
 
             if (!config.ScriptsEnabled)
                 return;
@@ -666,6 +673,7 @@ public static class DemoTargetPingPatch
                 GetOrCreateScriptValues(_config, relativePath)[configId] = rawValue ?? "";
                 _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
                 WriteConfigIfChanged(_config);
+                ApplyScriptConfigToLoadedScript(relativePath, _config, invokeChanged: true);
             }
         }
 
@@ -677,6 +685,7 @@ public static class DemoTargetPingPatch
             _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
             WriteConfigIfChanged(_config);
             ApplyScriptBindingsToLoadedScript(relativePath, _config);
+            ApplyScriptConfigToLoadedScript(relativePath, _config, invokeChanged: true);
         }
 
         static IReadOnlyDictionary<string, string> GetScriptBindings(string relativePath)
@@ -711,6 +720,25 @@ public static class DemoTargetPingPatch
         {
             foreach (var loadedScript in _loaded.Values.Where(script => string.Equals(script.RelativePath, relativePath, StringComparison.OrdinalIgnoreCase)))
                 ApplyScriptBindingsToLoadedScript(loadedScript, config);
+        }
+
+        static void ApplyScriptConfigToLoadedScript(LoadedScript loadedScript, ScriptEngineConfig config, bool invokeChanged = false)
+        {
+            if (loadedScript.Mod == null)
+                return;
+
+            if (!config.ScriptValues.TryGetValue(loadedScript.RelativePath, out var values))
+                values = EmptyBindings.Instance;
+
+            loadedScript.Mod.ScriptEngineApplyConfigValues(values);
+            if (invokeChanged)
+                loadedScript.Mod.ScriptEngineInvokeConfigChanged();
+        }
+
+        static void ApplyScriptConfigToLoadedScript(string relativePath, ScriptEngineConfig config, bool invokeChanged = false)
+        {
+            foreach (var loadedScript in _loaded.Values.Where(script => string.Equals(script.RelativePath, relativePath, StringComparison.OrdinalIgnoreCase)))
+                ApplyScriptConfigToLoadedScript(loadedScript, config, invokeChanged);
         }
 
         static void DrawWindow(int windowId)
@@ -843,6 +871,32 @@ public static class DemoTargetPingPatch
             }
 
             return values;
+        }
+
+        static bool ScriptConfigValuesChanged(string relativePath, ScriptEngineConfig before, ScriptEngineConfig after)
+        {
+            before.ScriptValues.TryGetValue(relativePath, out var beforeValues);
+            after.ScriptValues.TryGetValue(relativePath, out var afterValues);
+
+            if (beforeValues == null || beforeValues.Count == 0)
+                return afterValues != null && afterValues.Count != 0;
+
+            if (afterValues == null || afterValues.Count == 0)
+                return beforeValues.Count != 0;
+
+            if (beforeValues.Count != afterValues.Count)
+                return true;
+
+            foreach (var pair in beforeValues)
+            {
+                if (!afterValues.TryGetValue(pair.Key, out var afterValue))
+                    return true;
+
+                if (!string.Equals(pair.Value, afterValue, StringComparison.Ordinal))
+                    return true;
+            }
+
+            return false;
         }
 
         static bool TryParseScriptConfigKey(string key, out string configId)
