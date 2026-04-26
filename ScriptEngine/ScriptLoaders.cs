@@ -9,19 +9,19 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace ScriptEngine
 {
-    internal enum ScriptKind
+    public enum ScriptKind
     {
         Attribute,
     }
 
-    internal sealed class DiscoveredScript
+    public sealed class DiscoveredScript
     {
         public string FullPath = "";
         public string RelativePath = "";
         public ScriptKind Kind;
     }
 
-    internal sealed class LoadedScript
+    public sealed class LoadedScript
     {
         public string FullPath = "";
         public string RelativePath = "";
@@ -32,7 +32,7 @@ namespace ScriptEngine
         public ScriptLog Log = null!;
     }
 
-    internal static class ScriptDiscovery
+    public static class ScriptDiscovery
     {
         static readonly HashSet<string> IgnoredDirectoryNames = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -159,7 +159,7 @@ namespace ScriptEngine
                 });
     }
 
-    internal sealed class ScriptCompiler
+    public sealed class ScriptCompiler
     {
         const string InjectedScriptApiSource =
 @"using System;
@@ -314,13 +314,13 @@ namespace ScriptEngine
         }
     }
 
-    internal interface IScriptLoader
+    public interface IScriptLoader
     {
         ScriptKind Kind { get; }
         LoadedScript? Load(DiscoveredScript script, Assembly assembly, ScriptLog log, Action<string, string, Exception> runtimeExceptionHandler, out string? errorText);
     }
 
-    internal sealed class AttributeScriptLoader : IScriptLoader
+    public sealed class AttributeScriptLoader : IScriptLoader
     {
         public ScriptKind Kind => ScriptKind.Attribute;
 

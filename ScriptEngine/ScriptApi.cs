@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using MelonLoader;
 
 namespace ScriptEngine
@@ -26,6 +27,36 @@ namespace ScriptEngine
         void ScriptEngineApplyRawValue(string rawValue);
     }
 
+    public sealed class ScriptModRecord
+    {
+        public ScriptModRecord(
+            string id,
+            string fullPath,
+            ScriptKind kind,
+            string error,
+            ScriptConfigEntry<bool> enabled,
+            ScriptModBase? instance)
+        {
+            Id = id;
+            FullPath = fullPath;
+            Kind = kind;
+            Error = error;
+            Enabled = enabled;
+            Instance = instance;
+        }
+
+        public string Id { get; }
+        public string FullPath { get; }
+        public ScriptKind Kind { get; }
+        public string DisplayName => Path.ChangeExtension(Id.Replace('\\', '/'), null) ?? Id;
+        public bool IsLoaded => Instance != null;
+        public bool HasError => !string.IsNullOrWhiteSpace(Error);
+        public string Error { get; }
+        public ScriptConfigEntry<bool> Enabled { get; }
+        public ScriptModBase? Instance { get; }
+        public IReadOnlyDictionary<string, IScriptConfigEntry>? Config => Instance?.Config;
+    }
+
     public sealed class ScriptConfigEntry<T>
         : IScriptConfigEntry
     {
@@ -40,7 +71,8 @@ namespace ScriptEngine
             T defaultValue,
             TryParseConfigValue<T> tryParse,
             Func<T, string> format,
-            Action<ScriptConfigEntry<T>> onChanged)
+            Action<ScriptConfigEntry<T>> onChanged,
+            T[]? allowedValues = null)
         {
             Id = id;
             _rawValue = rawValue;
@@ -48,10 +80,17 @@ namespace ScriptEngine
             _tryParse = tryParse;
             _format = format;
             _onChanged = onChanged;
+            AllowedValues = allowedValues != null && allowedValues.Length != 0
+                ? allowedValues.ToArray()
+                : null;
+
+            if (AllowedValues != null && !AllowedValues.Contains(defaultValue))
+                throw new ArgumentException("Default value must be included in allowed values.", nameof(defaultValue));
         }
 
         public string Id { get; }
         public T DefaultValue { get; }
+        public IReadOnlyList<T>? AllowedValues { get; }
 
         public string RawValue
         {
@@ -70,19 +109,28 @@ namespace ScriptEngine
         {
             get
             {
-                if (_tryParse(_rawValue, out var value))
+                if (_tryParse(_rawValue, out var value) && IsAcceptable(value))
                     return value;
 
                 Value = DefaultValue;
                 return DefaultValue;
             }
-            set => RawValue = _format(value);
+            set
+            {
+                if (!IsAcceptable(value))
+                    throw new ArgumentOutOfRangeException(nameof(value), "Value is not in allowed values.");
+
+                RawValue = _format(value);
+            }
         }
 
         public void ScriptEngineApplyRawValue(string rawValue)
         {
             _rawValue = rawValue;
         }
+
+        bool IsAcceptable(T value) =>
+            AllowedValues == null || AllowedValues.Contains(value);
     }
 
     public abstract class ScriptModBase
@@ -100,6 +148,7 @@ namespace ScriptEngine
 
         public string ScriptId { get; }
         public ScriptKeyBindings Keys => _keys;
+        public IReadOnlyDictionary<string, IScriptConfigEntry> Config => _configEntries;
 
         protected ScriptModBase()
         {
@@ -139,7 +188,7 @@ namespace ScriptEngine
         public void BindKey(string id, string defaultBinding) => _keys.Register(id, defaultBinding);
         public bool WasPressed(string id) => _keys.WasPressed(id);
 
-        public ScriptConfigEntry<int> BindInt(string id, int defaultValue)
+        public ScriptConfigEntry<int> BindInt(string id, int defaultValue, int[]? allowedValues = null)
         {
             var defaultText = defaultValue.ToString(CultureInfo.InvariantCulture);
             var rawValue = _configRegistrar(id, defaultText);
@@ -149,10 +198,11 @@ namespace ScriptEngine
                 defaultValue,
                 static (string text, out int value) => int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value),
                 static value => value.ToString(CultureInfo.InvariantCulture),
-                entry => _configSetter(entry.Id, entry.RawValue)));
+                entry => _configSetter(entry.Id, entry.RawValue),
+                allowedValues));
         }
 
-        public ScriptConfigEntry<float> BindFloat(string id, float defaultValue)
+        public ScriptConfigEntry<float> BindFloat(string id, float defaultValue, float[]? allowedValues = null)
         {
             var defaultText = defaultValue.ToString(CultureInfo.InvariantCulture);
             var rawValue = _configRegistrar(id, defaultText);
@@ -162,10 +212,11 @@ namespace ScriptEngine
                 defaultValue,
                 static (string text, out float value) => float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value),
                 static value => value.ToString(CultureInfo.InvariantCulture),
-                entry => _configSetter(entry.Id, entry.RawValue)));
+                entry => _configSetter(entry.Id, entry.RawValue),
+                allowedValues));
         }
 
-        public ScriptConfigEntry<bool> BindBool(string id, bool defaultValue)
+        public ScriptConfigEntry<bool> BindBool(string id, bool defaultValue, bool[]? allowedValues = null)
         {
             var defaultText = defaultValue ? "true" : "false";
             var rawValue = _configRegistrar(id, defaultText);
@@ -175,7 +226,8 @@ namespace ScriptEngine
                 defaultValue,
                 static (string text, out bool value) => bool.TryParse(text, out value),
                 static value => value ? "true" : "false",
-                entry => _configSetter(entry.Id, entry.RawValue)));
+                entry => _configSetter(entry.Id, entry.RawValue),
+                allowedValues));
         }
 
         ScriptConfigEntry<T> RegisterConfigEntry<T>(ScriptConfigEntry<T> entry)

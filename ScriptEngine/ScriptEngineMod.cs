@@ -65,6 +65,7 @@ public static class DemoTargetPingPatch
 }";
 
         static readonly Dictionary<string, LoadedScript> _loaded = new(StringComparer.OrdinalIgnoreCase);
+        static readonly Dictionary<string, ScriptModRecord> _mods = new(StringComparer.OrdinalIgnoreCase);
         static readonly Dictionary<ScriptKind, IScriptLoader> _loaders = new()
         {
             [ScriptKind.Attribute] = new AttributeScriptLoader(),
@@ -101,6 +102,58 @@ public static class DemoTargetPingPatch
             _scrollPosition ??= RuntimeGui.CreateVector2(0f, 0f);
             RuntimeGui.SetDepth(0);
             _windowRect = RuntimeGui.Window(0x51C12E, _windowRect, DrawWindow, "ScriptEngine");
+        }
+
+        public static IReadOnlyDictionary<string, ScriptModRecord> Mods
+        {
+            get
+            {
+                lock (_stateLock)
+                {
+                    return new Dictionary<string, ScriptModRecord>(_mods, StringComparer.OrdinalIgnoreCase);
+                }
+            }
+        }
+
+        public static ScriptModRecord? GetMod(string id)
+        {
+            if (string.IsNullOrWhiteSpace(id))
+                throw new ArgumentException("Mod id cannot be null or empty.", nameof(id));
+
+            lock (_stateLock)
+            {
+                return _mods.TryGetValue(id, out var mod) ? mod : null;
+            }
+        }
+
+        static ScriptModRecord CreateScriptModRecord(DiscoveredScript script)
+        {
+            var enabled = _config.ScriptEnabled.TryGetValue(script.RelativePath, out var configuredEnabled)
+                ? configuredEnabled
+                : true;
+            var rawEnabled = enabled ? "true" : "false";
+            var enabledEntry = new ScriptConfigEntry<bool>(
+                "enabled",
+                rawEnabled,
+                true,
+                static (string text, out bool value) => bool.TryParse(text, out value),
+                static value => value ? "true" : "false",
+                entry =>
+                {
+                    if (TryParseBool(entry.RawValue, out var parsedEnabled))
+                        SetScriptEnabled(script.RelativePath, parsedEnabled);
+                },
+                null);
+
+            var loaded = _loaded.Values.FirstOrDefault(loadedScript => string.Equals(loadedScript.RelativePath, script.RelativePath, StringComparison.OrdinalIgnoreCase));
+            _config.ScriptErrors.TryGetValue(script.RelativePath, out var error);
+            return new ScriptModRecord(
+                script.RelativePath,
+                script.FullPath,
+                script.Kind,
+                error ?? "",
+                enabledEntry,
+                loaded?.Mod);
         }
 
         public override void OnInitializeMelon()
@@ -315,6 +368,7 @@ public static class DemoTargetPingPatch
             _config = normalizedConfig;
             WriteConfigIfChanged(normalizedConfig);
             ApplyConfigToRuntime(normalizedConfig, currentScripts, previousConfig);
+            UpdateModRecords(currentScripts);
         }
 
         static void ApplyConfigToRuntime(ScriptEngineConfig config, Dictionary<string, DiscoveredScript> currentScripts, ScriptEngineConfig? previousConfig = null)
@@ -351,10 +405,19 @@ public static class DemoTargetPingPatch
                 MelonLogger.Msg($"[ScriptEngine] Loading enabled script: {script.RelativePath}");
                 LoadScript(script);
             }
+
+            UpdateModRecords(currentScripts);
         }
 
         static Dictionary<string, DiscoveredScript> GetCurrentScripts() =>
             ScriptDiscovery.GetCurrentScripts(ScriptsDir);
+
+        static void UpdateModRecords(Dictionary<string, DiscoveredScript> currentScripts)
+        {
+            _mods.Clear();
+            foreach (var script in currentScripts.Values.OrderBy(script => script.RelativePath, StringComparer.OrdinalIgnoreCase))
+                _mods[script.RelativePath] = CreateScriptModRecord(script);
+        }
 
         static ScriptEngineConfig ReadConfigFromDisk()
         {
@@ -544,6 +607,7 @@ public static class DemoTargetPingPatch
             _config.ScriptEnabled[relativePath] = enabled;
             _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
             WriteConfigIfChanged(_config);
+            UpdateModRecords(GetCurrentScripts());
         }
 
         static void RemoveScriptConfigEntry(string relativePath)
@@ -557,25 +621,37 @@ public static class DemoTargetPingPatch
             ClearBindingEditorState(relativePath);
             _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
             WriteConfigIfChanged(_config);
+            UpdateModRecords(GetCurrentScripts());
         }
 
-        static void SetScriptsEnabled(bool enabled)
+        public static void SetScriptsEnabled(bool enabled)
         {
-            _config.ScriptsEnabled = enabled;
-            _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
-            WriteConfigIfChanged(_config);
-            ApplyConfigToRuntime(_config, GetCurrentScripts());
+            lock (_stateLock)
+            {
+                _config.ScriptsEnabled = enabled;
+                _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+                WriteConfigIfChanged(_config);
+                ApplyConfigToRuntime(_config, GetCurrentScripts());
+                UpdateModRecords(GetCurrentScripts());
+            }
         }
 
-        static void SetScriptEnabled(string relativePath, bool enabled)
+        public static void SetScriptEnabled(string relativePath, bool enabled)
         {
-            _config.ScriptEnabled[relativePath] = enabled;
-            if (enabled)
-                _config.ScriptErrors.Remove(relativePath);
+            if (string.IsNullOrWhiteSpace(relativePath))
+                throw new ArgumentException("Relative path cannot be null or empty.", nameof(relativePath));
 
-            _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
-            WriteConfigIfChanged(_config);
-            ApplyConfigToRuntime(_config, GetCurrentScripts());
+            lock (_stateLock)
+            {
+                _config.ScriptEnabled[relativePath] = enabled;
+                if (enabled)
+                    _config.ScriptErrors.Remove(relativePath);
+
+                _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+                WriteConfigIfChanged(_config);
+                ApplyConfigToRuntime(_config, GetCurrentScripts());
+                UpdateModRecords(GetCurrentScripts());
+            }
         }
 
         static void SetScriptError(string relativePath, string? error)
@@ -587,9 +663,10 @@ public static class DemoTargetPingPatch
 
             _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
             WriteConfigIfChanged(_config);
+            UpdateModRecords(GetCurrentScripts());
         }
 
-        internal static string RegisterScriptKeyBinding(string relativePath, string bindingId, string defaultBinding)
+        public static string RegisterScriptKeyBinding(string relativePath, string bindingId, string defaultBinding)
         {
             lock (_stateLock)
             {
@@ -628,7 +705,7 @@ public static class DemoTargetPingPatch
             }
         }
 
-        internal static string RegisterScriptConfigValue(string relativePath, string configId, string defaultValue)
+        public static string RegisterScriptConfigValue(string relativePath, string configId, string defaultValue)
         {
             lock (_stateLock)
             {
@@ -656,7 +733,7 @@ public static class DemoTargetPingPatch
             }
         }
 
-        internal static void SetScriptConfigValue(string relativePath, string configId, string rawValue)
+        public static void SetScriptConfigValue(string relativePath, string configId, string rawValue)
         {
             lock (_stateLock)
             {
@@ -1060,6 +1137,7 @@ public static class DemoTargetPingPatch
 
             SetScriptError(script.RelativePath, null);
             _loaded[fullPath] = loaded;
+            UpdateModRecords(GetCurrentScripts());
         }
 
         static void UnloadScript(string path)
@@ -1075,6 +1153,7 @@ public static class DemoTargetPingPatch
             finally
             {
                 _loaded.Remove(path);
+                UpdateModRecords(GetCurrentScripts());
             }
         }
 
@@ -1094,14 +1173,14 @@ public static class DemoTargetPingPatch
         }
     }
 
-    enum ConfigSection
+    public enum ConfigSection
     {
         None,
         ScriptsRoot,
         Script,
     }
 
-    class ScriptEngineConfig
+    public class ScriptEngineConfig
     {
         public bool ScriptsEnabled = true;
         public Dictionary<string, bool> ScriptEnabled = new(StringComparer.OrdinalIgnoreCase);
@@ -1110,7 +1189,7 @@ public static class DemoTargetPingPatch
         public Dictionary<string, Dictionary<string, string>> ScriptBindings = new(StringComparer.OrdinalIgnoreCase);
     }
 
-    sealed class EmptyBindings : Dictionary<string, string>
+    public sealed class EmptyBindings : Dictionary<string, string>
     {
         public static readonly EmptyBindings Instance = new();
 
@@ -1120,7 +1199,7 @@ public static class DemoTargetPingPatch
         }
     }
 
-    static class RuntimeGui
+    public static class RuntimeGui
     {
         static bool _initialized;
         static bool _loggedInitializationFailure;

@@ -5,7 +5,7 @@ using System.Reflection;
 
 namespace ScriptEngine
 {
-    internal static class UnityRuntime
+    public static class UnityRuntime
     {
         static bool _initialized;
         static Type? _gameObjectType;
@@ -78,7 +78,7 @@ namespace ScriptEngine
         }
     }
 
-    internal static class HarmonyRuntime
+    public static class HarmonyRuntime
     {
         static bool _initialized;
         static Type? _harmonyType;
