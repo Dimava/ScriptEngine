@@ -9,7 +9,7 @@ using System.Threading;
 using MelonLoader;
 using MelonLoader.Utils;
 
-[assembly: MelonInfo(typeof(ScriptEngine.ScriptEngineMod), "ScriptEngine", "1.1.0", "Dimava")]
+[assembly: MelonInfo(typeof(ScriptEngine.ScriptEngineMod), "ScriptEngine", "1.1.1", "Dimava")]
 [assembly: MelonGame()]
 
 namespace ScriptEngine

@@ -22,7 +22,7 @@ Skips dotnet build and packages the current output directory as-is.
 #>
 param(
     [Parameter(Mandatory = $false)]
-    [string]$Version = "1.1.0",
+    [string]$Version = "1.1.1",
 
     [Parameter(Mandatory = $false)]
     [string]$Configuration = "Release",
