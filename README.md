@@ -54,6 +54,8 @@ ScriptEngine also maintains `<GameDir>/Scripts/ScriptEngine.cfg` to control whic
 ```toml
 [scripts]
 enabled = true
+enableNewScripts = true
+enableNewEvalScripts = true
 
 [scripts."ConnectionHotkey.cs"]
 enabled = false
@@ -67,7 +69,8 @@ error = "The name \"Foo\" does not exist in the current context (12,8)"
 
 - Script keys are paths relative to `Scripts/`, normalized with `/`
 - `[scripts].enabled` controls the global script system state
-- Missing scripts are added automatically with `enabled = true`
+- Missing scripts are added automatically using `enableNewScripts`
+- Missing `Eval/*` scripts use `enableNewEvalScripts` instead
 - Registered script keys are stored as flat `key...` entries inside the script section
 - Deleted scripts are removed from the config automatically
 - Editing `ScriptEngine.cfg` while the game is running applies immediately
@@ -76,6 +79,30 @@ error = "The name \"Foo\" does not exist in the current context (12,8)"
 - Runtime callback exceptions disable the script and write the exception into `error`
 - Per-script logs are written to `Scripts/logs/<relative-script-path>.log`
 - The `Scripts/logs/` session logs are reset on game launch, not on hot-reload
+
+## Eval scripts
+
+`Scripts/Eval` is for one-shot in-game probes. Keep eval files inert with `[ScriptEval]`; run `Scripts/Eval/Invoke-Eval.ps1` to temporarily switch the first marker to `[ScriptEntry]`, wait for the intentional load failure, restore `[ScriptEval]`, and print the eval script's personal log.
+
+```powershell
+& 'Scripts\Eval\Invoke-Eval.ps1' -Script 'Eval/MyEval.cs'
+```
+
+Eval scripts should log their result and then throw so ScriptEngine unloads them:
+
+```csharp
+using ScriptEngine;
+
+[ScriptEval]
+public sealed class MyEval : ScriptMod
+{
+    protected override void OnEnable()
+    {
+        Log("EVAL_RESULT ...");
+        throw new System.Exception("EVAL_DONE");
+    }
+}
+```
 
 ## Writing `ScriptMod` scripts
 

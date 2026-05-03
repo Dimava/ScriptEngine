@@ -157,13 +157,13 @@ function Add-CleanScripts {
     }
 
     $scriptsRoot = Join-Path $StagingRoot "Scripts"
-    $scriptsDest = Join-Path $scriptsRoot "Dimava"
-    New-Item -ItemType Directory -Force -Path $scriptsDest | Out-Null
+    New-Item -ItemType Directory -Force -Path $scriptsRoot | Out-Null
 
     $defaultConfig = @"
 [scripts]
 enabled = true
 enableNewScripts = false
+enableNewEvalScripts = true
 
 [scripts."Dimava/+ScriptEngineSettingsTab.cs"]
 enabled = true
@@ -171,22 +171,35 @@ enabled = true
     Set-Content -Path (Join-Path $scriptsRoot "ScriptEngine.cfg") -Value $defaultConfig -Encoding ASCII
 
     $excludeDirs = @(".git", "bin", "obj", "node_modules", "logs")
-    $sourceFull = (Resolve-Path -LiteralPath $sourceDimava).Path.TrimEnd('\')
-
-    Get-ChildItem -LiteralPath $sourceDimava -Recurse -Force | ForEach-Object {
-        $rel = $_.FullName.Substring($sourceFull.Length).TrimStart('\')
-        $segments = $rel -split '[\\/]+'
-        foreach ($seg in $segments) {
-            if ($excludeDirs -contains $seg -or $seg.StartsWith('.')) { return }
+    foreach ($folderName in @("Dimava", "Eval")) {
+        $sourceFolder = Join-Path $resolvedScriptsDir $folderName
+        if ($folderName -eq "Eval" -and -not (Test-Path $sourceFolder)) {
+            $sourceFolder = Join-Path $PSScriptRoot "Eval"
         }
 
-        $target = Join-Path $scriptsDest $rel
-        if ($_.PSIsContainer) {
-            New-Item -ItemType Directory -Force -Path $target | Out-Null
-        } else {
-            $targetDir = Split-Path -Parent $target
-            New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
-            Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+        if (-not (Test-Path $sourceFolder)) {
+            continue
+        }
+
+        $scriptsDest = Join-Path $scriptsRoot $folderName
+        New-Item -ItemType Directory -Force -Path $scriptsDest | Out-Null
+        $sourceFull = (Resolve-Path -LiteralPath $sourceFolder).Path.TrimEnd('\')
+
+        Get-ChildItem -LiteralPath $sourceFolder -Recurse -Force | ForEach-Object {
+            $rel = $_.FullName.Substring($sourceFull.Length).TrimStart('\')
+            $segments = $rel -split '[\\/]+'
+            foreach ($seg in $segments) {
+                if ($excludeDirs -contains $seg -or $seg.StartsWith('.')) { return }
+            }
+
+            $target = Join-Path $scriptsDest $rel
+            if ($_.PSIsContainer) {
+                New-Item -ItemType Directory -Force -Path $target | Out-Null
+            } else {
+                $targetDir = Split-Path -Parent $target
+                New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+                Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+            }
         }
     }
 }

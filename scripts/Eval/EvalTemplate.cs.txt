@@ -1,0 +1,11 @@
+using ScriptEngine;
+
+[ScriptEval]
+public sealed class MyEval : ScriptMod
+{
+    protected override void OnEnable()
+    {
+        Log("EVAL_RESULT ...");
+        throw new System.Exception("EVAL_DONE");
+    }
+}

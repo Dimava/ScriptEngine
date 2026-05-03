@@ -198,11 +198,29 @@ namespace ScriptEngine
     }
 }";
 
+        static readonly CSharpParseOptions ParseOptions = CSharpParseOptions.Default;
+        static readonly SyntaxTree InjectedScriptApiTree = CSharpSyntaxTree.ParseText(
+            InjectedScriptApiSource,
+            options: ParseOptions,
+            path: "__ScriptEngine_Injected.cs");
+
+        readonly object _referenceLock = new();
+        MetadataReference[]? _metadataReferences;
+
         public ScriptCompiler()
         {
+            AppDomain.CurrentDomain.AssemblyLoad += (_, _) => ClearMetadataReferenceCache();
         }
 
         public Assembly? Compile(DiscoveredScript script, ScriptLog log, out string? errorText)
+        {
+            var assemblyBytes = CompileToAssemblyBytes(script, log, out errorText);
+            return assemblyBytes == null
+                ? null
+                : Assembly.Load(assemblyBytes);
+        }
+
+        public byte[]? CompileToAssemblyBytes(DiscoveredScript script, ScriptLog log, out string? errorText)
         {
             errorText = null;
 
@@ -222,10 +240,10 @@ namespace ScriptEngine
 
             var trees = new List<SyntaxTree>
             {
-                CSharpSyntaxTree.ParseText(source, path: script.FullPath),
+                CSharpSyntaxTree.ParseText(source, options: ParseOptions, path: script.FullPath),
             };
             if (script.Kind == ScriptKind.Attribute)
-                trees.Add(CSharpSyntaxTree.ParseText(InjectedScriptApiSource, path: "__ScriptEngine_Injected.cs"));
+                trees.Add(InjectedScriptApiTree);
 
             var compilation = CSharpCompilation.Create(
                 assemblyName: Path.GetFileNameWithoutExtension(script.FullPath) + "_" + DateTime.Now.Ticks,
@@ -252,7 +270,7 @@ namespace ScriptEngine
             }
 
             ms.Seek(0, SeekOrigin.Begin);
-            return Assembly.Load(ms.ToArray());
+            return ms.ToArray();
         }
 
         string FormatDiagnostic(Diagnostic diagnostic)
@@ -265,16 +283,30 @@ namespace ScriptEngine
             return $"{fileName}: {diagnostic.GetMessage()} ({line},{character})";
         }
 
-        IEnumerable<MetadataReference> GetMetadataReferences()
+        MetadataReference[] GetMetadataReferences()
+        {
+            var cached = _metadataReferences;
+            if (cached != null)
+                return cached;
+
+            lock (_referenceLock)
+            {
+                _metadataReferences ??= BuildMetadataReferences();
+                return _metadataReferences;
+            }
+        }
+
+        MetadataReference[] BuildMetadataReferences()
         {
             var refs = new List<MetadataReference>();
+            var refPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
                 try
                 {
                     if (!string.IsNullOrEmpty(asm.Location))
-                        refs.Add(MetadataReference.CreateFromFile(asm.Location));
+                        AddReference(refs, refPaths, asm.Location);
                 }
                 catch { }
             }
@@ -293,13 +325,28 @@ namespace ScriptEngine
                 {
                     if (!loadedPaths.Contains(Path.GetFullPath(dll)))
                     {
-                        try { refs.Add(MetadataReference.CreateFromFile(dll)); }
+                        try { AddReference(refs, refPaths, dll); }
                         catch { }
                     }
                 }
             }
 
-            return refs;
+            return refs.ToArray();
+        }
+
+        static void AddReference(List<MetadataReference> refs, HashSet<string> refPaths, string path)
+        {
+            var fullPath = Path.GetFullPath(path);
+            if (!refPaths.Add(fullPath))
+                return;
+
+            refs.Add(MetadataReference.CreateFromFile(fullPath));
+        }
+
+        void ClearMetadataReferenceCache()
+        {
+            lock (_referenceLock)
+                _metadataReferences = null;
         }
 
         static string? TryGetAssemblyLocation(Assembly assembly)
@@ -377,6 +424,7 @@ namespace ScriptEngine
                     Log = log,
                     GameObject = gameObject,
                     RuntimeExceptionHandler = (callbackName, ex) => runtimeExceptionHandler(script.RelativePath, callbackName, ex),
+                    PerformanceRecorder = (callbackName, elapsedTicks) => ScriptEngineMod.RecordScriptCallbackDuration(script.RelativePath, callbackName, elapsedTicks),
                     BindingRegistrar = (bindingId, defaultBinding) => ScriptEngineMod.RegisterScriptKeyBinding(script.RelativePath, bindingId, defaultBinding),
                     ConfigRegistrar = (configId, defaultValue) => ScriptEngineMod.RegisterScriptConfigValue(script.RelativePath, configId, defaultValue),
                     ConfigSetter = (configId, rawValue) => ScriptEngineMod.SetScriptConfigValue(script.RelativePath, configId, rawValue),

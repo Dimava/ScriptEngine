@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Diagnostics;
 
 namespace ScriptEngine
 {
@@ -12,6 +13,7 @@ namespace ScriptEngine
         public ScriptLog Log = null!;
         public object GameObject = null!;
         public Action<string, Exception> RuntimeExceptionHandler = null!;
+        public Action<string, long> PerformanceRecorder = null!;
         public Func<string, string, string> BindingRegistrar = null!;
         public Func<string, string, string> ConfigRegistrar = null!;
         public Action<string, string> ConfigSetter = null!;
@@ -34,7 +36,8 @@ namespace ScriptEngine
             ScriptKind kind,
             string error,
             ScriptConfigEntry<bool> enabled,
-            ScriptModBase? instance)
+            ScriptModBase? instance,
+            ScriptPerformanceSnapshot performance)
         {
             Id = id;
             FullPath = fullPath;
@@ -42,6 +45,7 @@ namespace ScriptEngine
             Error = error;
             Enabled = enabled;
             Instance = instance;
+            Performance = performance;
         }
 
         public string Id { get; }
@@ -54,6 +58,37 @@ namespace ScriptEngine
         public ScriptConfigEntry<bool> Enabled { get; }
         public ScriptModBase? Instance { get; }
         public IReadOnlyDictionary<string, IScriptConfigEntry>? Config => Instance?.Config;
+        public ScriptPerformanceSnapshot Performance { get; }
+    }
+
+    public sealed class ScriptPerformanceSnapshot
+    {
+        public static readonly ScriptPerformanceSnapshot Empty = new(new Dictionary<string, ScriptCallbackPerformance>(StringComparer.Ordinal));
+
+        public ScriptPerformanceSnapshot(IReadOnlyDictionary<string, ScriptCallbackPerformance> callbacks)
+        {
+            Callbacks = callbacks;
+        }
+
+        public IReadOnlyDictionary<string, ScriptCallbackPerformance> Callbacks { get; }
+    }
+
+    public sealed class ScriptCallbackPerformance
+    {
+        public ScriptCallbackPerformance(long calls, double totalMilliseconds, double averageMilliseconds, double maxMilliseconds, double lastMilliseconds)
+        {
+            Calls = calls;
+            TotalMilliseconds = totalMilliseconds;
+            AverageMilliseconds = averageMilliseconds;
+            MaxMilliseconds = maxMilliseconds;
+            LastMilliseconds = lastMilliseconds;
+        }
+
+        public long Calls { get; }
+        public double TotalMilliseconds { get; }
+        public double AverageMilliseconds { get; }
+        public double MaxMilliseconds { get; }
+        public double LastMilliseconds { get; }
     }
 
     public sealed class ScriptConfigEntry<T>
@@ -140,6 +175,7 @@ namespace ScriptEngine
         ScriptLog _log;
         protected object _gameObject;
         Action<string, Exception> _runtimeExceptionHandler;
+        Action<string, long> _performanceRecorder;
         Func<string, string, string> _configRegistrar;
         Action<string, string> _configSetter;
         ScriptKeyBindings _keys;
@@ -156,6 +192,7 @@ namespace ScriptEngine
             _log = ctx.Log;
             _gameObject = ctx.GameObject;
             _runtimeExceptionHandler = ctx.RuntimeExceptionHandler;
+            _performanceRecorder = ctx.PerformanceRecorder;
             _configRegistrar = ctx.ConfigRegistrar;
             _configSetter = ctx.ConfigSetter;
             _keys = new ScriptKeyBindings(ctx.BindingRegistrar);
@@ -253,6 +290,7 @@ namespace ScriptEngine
 
         void InvokeFrameCallback(string callbackName, Action callback)
         {
+            var startedAt = Stopwatch.GetTimestamp();
             try
             {
                 callback();
@@ -260,6 +298,10 @@ namespace ScriptEngine
             catch (Exception ex)
             {
                 _runtimeExceptionHandler(callbackName, ex);
+            }
+            finally
+            {
+                _performanceRecorder(callbackName, Stopwatch.GetTimestamp() - startedAt);
             }
         }
     }

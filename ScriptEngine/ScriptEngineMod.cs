@@ -6,6 +6,8 @@ using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
+using System.Diagnostics;
 using BepInEx;
 using BepInEx.Logging;
 
@@ -14,6 +16,7 @@ namespace ScriptEngine
     [BepInPlugin("dev.dimava.modulus.scriptengine", "ScriptEngine", MyPluginInfo.PLUGIN_VERSION)]
     public class ScriptEngineMod : BaseUnityPlugin
     {
+        const double MinDisplayedAverageCallbackMilliseconds = 0.010d;
         internal static ManualLogSource? LogSource;
         static string ScriptsDir = null!;
         static string GameDir = null!;
@@ -65,6 +68,7 @@ public static class DemoTargetPingPatch
 
         static readonly Dictionary<string, LoadedScript> _loaded = new(StringComparer.OrdinalIgnoreCase);
         static readonly Dictionary<string, ScriptModRecord> _mods = new(StringComparer.OrdinalIgnoreCase);
+        static readonly Dictionary<string, ScriptPerformanceTracker> _performance = new(StringComparer.OrdinalIgnoreCase);
         static readonly Dictionary<ScriptKind, IScriptLoader> _loaders = new()
         {
             [ScriptKind.Attribute] = new AttributeScriptLoader(),
@@ -186,7 +190,8 @@ public static class DemoTargetPingPatch
                 script.Kind,
                 error ?? "",
                 enabledEntry,
-                loaded?.Mod);
+                loaded?.Mod,
+                GetScriptPerformance(relativePath: script.RelativePath));
         }
 
         void Awake()
@@ -372,7 +377,7 @@ public static class DemoTargetPingPatch
                 return;
             }
 
-            EnsureScriptConfigEntry(relativePath, enabled: _config.EnableNewScripts);
+            EnsureScriptConfigEntry(relativePath, enabled: GetDefaultEnabledForScript(relativePath, _config));
             if (!ShouldLoadScript(relativePath))
             {
                 UnloadScript(path);
@@ -410,7 +415,7 @@ public static class DemoTargetPingPatch
             if (!currentScripts.TryGetValue(newRelativePath, out var script))
                 return;
 
-            EnsureScriptConfigEntry(newRelativePath, enabled: _config.EnableNewScripts, overwrite: true);
+            EnsureScriptConfigEntry(newRelativePath, enabled: GetDefaultEnabledForScript(newRelativePath, _config), overwrite: true);
             if (!ShouldLoadScript(newRelativePath))
             {
                 ScriptEngineLog.Msg($"[ScriptEngine] Ignoring disabled script: {newRelativePath}");
@@ -457,19 +462,56 @@ public static class DemoTargetPingPatch
             if (!config.ScriptsEnabled)
                 return;
 
-            foreach (var script in currentScripts.Values.OrderBy(s => s.RelativePath, StringComparer.OrdinalIgnoreCase))
+            var scriptsToLoad = currentScripts.Values
+                .OrderBy(s => s.RelativePath, StringComparer.OrdinalIgnoreCase)
+                .Where(script => ShouldLoadScript(script.RelativePath, config))
+                .Where(script => !_loaded.ContainsKey(script.FullPath))
+                .ToArray();
+
+            if (scriptsToLoad.Length == 0)
             {
-                if (!ShouldLoadScript(script.RelativePath, config))
-                    continue;
+                UpdateModRecords(currentScripts);
+                return;
+            }
 
-                if (_loaded.ContainsKey(script.FullPath))
-                    continue;
-
+            if (scriptsToLoad.Length == 1)
+            {
+                var script = scriptsToLoad[0];
                 ScriptEngineLog.Msg($"[ScriptEngine] Loading enabled script: {script.RelativePath}");
                 LoadScript(script);
             }
+            else
+            {
+                ScriptEngineLog.Msg($"[ScriptEngine] Compiling {scriptsToLoad.Length} enabled scripts in parallel...");
+                var compiledScripts = CompileScriptsInParallel(scriptsToLoad);
+                foreach (var compiledScript in compiledScripts)
+                {
+                    if (compiledScript.AssemblyBytes == null)
+                    {
+                        SetScriptError(compiledScript.Script.RelativePath, compiledScript.ErrorText);
+                        continue;
+                    }
+
+                    ScriptEngineLog.Msg($"[ScriptEngine] Starting enabled script: {compiledScript.Script.RelativePath}");
+                    LoadCompiledScript(compiledScript.Script, compiledScript.Log, compiledScript.AssemblyBytes);
+                }
+            }
 
             UpdateModRecords(currentScripts);
+        }
+
+        static CompiledScript[] CompileScriptsInParallel(DiscoveredScript[] scripts)
+        {
+            var results = new CompiledScript[scripts.Length];
+            Parallel.For(0, scripts.Length, i =>
+            {
+                var script = scripts[i];
+                var log = ScriptLog.ForScript(ScriptsDir, script.RelativePath);
+                var assemblyBytes = _compiler.CompileToAssemblyBytes(script, log, out var compileError);
+                results[i] = new CompiledScript(script, log, assemblyBytes, compileError);
+            });
+
+            return results;
         }
 
         static Dictionary<string, DiscoveredScript> GetCurrentScripts() =>
@@ -548,6 +590,15 @@ public static class DemoTargetPingPatch
                     continue;
                 }
 
+                if (currentSection == ConfigSection.ScriptsRoot && key.Equals("enableNewEvalScripts", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!TryParseBool(value, out var parsedBool))
+                        continue;
+
+                    config.EnableNewEvalScripts = parsedBool;
+                    continue;
+                }
+
                 if (currentSection == ConfigSection.Script && currentScript != null)
                 {
                     if (key.Equals("enabled", StringComparison.OrdinalIgnoreCase))
@@ -582,11 +633,12 @@ public static class DemoTargetPingPatch
             {
                 ScriptsEnabled = config.ScriptsEnabled,
                 EnableNewScripts = config.EnableNewScripts,
+                EnableNewEvalScripts = config.EnableNewEvalScripts,
             };
 
             foreach (var script in currentScripts.OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
             {
-                normalized.ScriptEnabled[script] = config.ScriptEnabled.TryGetValue(script, out var enabled) ? enabled : config.EnableNewScripts;
+                normalized.ScriptEnabled[script] = config.ScriptEnabled.TryGetValue(script, out var enabled) ? enabled : GetDefaultEnabledForScript(script, config);
                 if (config.ScriptErrors.TryGetValue(script, out var error) && !string.IsNullOrWhiteSpace(error))
                     normalized.ScriptErrors[script] = error;
                 if (config.ScriptValues.TryGetValue(script, out var values) && values.Count != 0)
@@ -618,11 +670,18 @@ public static class DemoTargetPingPatch
         static string SerializeConfig(ScriptEngineConfig config)
         {
             var sb = new StringBuilder();
+            sb.AppendLine("# FOR AGENTS:");
+            sb.AppendLine("# This file is managed by ScriptEngine core. ScriptEngine auto-adds/removes script sections, keys, bindings, errors, and defaults.");
+            sb.AppendLine("# DO NOT edit content unless you intentionally want to change an existing setting value.");
+            sb.AppendLine("# Structural changes and new settings MUST be generated by ScriptEngine code.");
+            sb.AppendLine();
             sb.AppendLine("[scripts]");
             sb.Append("enabled = ");
             sb.AppendLine(config.ScriptsEnabled ? "true" : "false");
             sb.Append("enableNewScripts = ");
             sb.AppendLine(config.EnableNewScripts ? "true" : "false");
+            sb.Append("enableNewEvalScripts = ");
+            sb.AppendLine(config.EnableNewEvalScripts ? "true" : "false");
 
             foreach (var script in config.ScriptEnabled.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
             {
@@ -699,6 +758,28 @@ public static class DemoTargetPingPatch
             UpdateModRecords(GetCurrentScripts());
         }
 
+        internal static void RecordScriptCallbackDuration(string relativePath, string callbackName, long elapsedTicks)
+        {
+            lock (_stateLock)
+            {
+                if (!_performance.TryGetValue(relativePath, out var tracker))
+                {
+                    tracker = new ScriptPerformanceTracker();
+                    _performance[relativePath] = tracker;
+                }
+
+                tracker.Record(callbackName, elapsedTicks);
+            }
+        }
+
+        static ScriptPerformanceSnapshot GetScriptPerformance(string relativePath)
+        {
+            if (!_performance.TryGetValue(relativePath, out var tracker))
+                return ScriptPerformanceSnapshot.Empty;
+
+            return tracker.CreateSnapshot();
+        }
+
         public static void SetScriptsEnabled(bool enabled)
         {
             lock (_stateLock)
@@ -716,6 +797,17 @@ public static class DemoTargetPingPatch
             lock (_stateLock)
             {
                 _config.EnableNewScripts = enabled;
+                _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
+                WriteConfigIfChanged(_config);
+                UpdateModRecords(GetCurrentScripts());
+            }
+        }
+
+        public static void SetEnableNewEvalScripts(bool enabled)
+        {
+            lock (_stateLock)
+            {
+                _config.EnableNewEvalScripts = enabled;
                 _config = NormalizeConfig(_config, GetCurrentScripts().Keys);
                 WriteConfigIfChanged(_config);
                 UpdateModRecords(GetCurrentScripts());
@@ -921,6 +1013,11 @@ public static class DemoTargetPingPatch
                 if (nextEnableNewScripts != enableNewScripts)
                     SetEnableNewScripts(nextEnableNewScripts);
 
+                bool enableNewEvalScripts = _config.EnableNewEvalScripts;
+                bool nextEnableNewEvalScripts = RuntimeGui.Toggle(enableNewEvalScripts, "Enable new Eval/* scripts");
+                if (nextEnableNewEvalScripts != enableNewEvalScripts)
+                    SetEnableNewEvalScripts(nextEnableNewEvalScripts);
+
                 _scrollPosition = RuntimeGui.BeginScrollView(_scrollPosition!);
                 foreach (var script in _config.ScriptEnabled.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase).ToList())
                 {
@@ -930,6 +1027,8 @@ public static class DemoTargetPingPatch
 
                     foreach (var bindingId in GetScriptBindingIds(script.Key))
                         DrawBindingEditor(script.Key, bindingId);
+
+                    DrawPerformanceSummary(script.Key);
 
                     if (_config.ScriptErrors.TryGetValue(script.Key, out var error) && !string.IsNullOrWhiteSpace(error))
                         RuntimeGui.Label($"error: {error.Replace("\r", "").Replace("\n", " | ")}");
@@ -983,6 +1082,23 @@ public static class DemoTargetPingPatch
             RuntimeGui.EndHorizontal();
         }
 
+        static void DrawPerformanceSummary(string relativePath)
+        {
+            var snapshot = GetScriptPerformance(relativePath);
+            if (snapshot.Callbacks.Count == 0)
+                return;
+
+            foreach (var callback in snapshot.Callbacks
+                .Where(pair => pair.Value.AverageMilliseconds >= MinDisplayedAverageCallbackMilliseconds)
+                .OrderByDescending(pair => pair.Value.AverageMilliseconds)
+                .ThenBy(pair => pair.Key, StringComparer.Ordinal))
+            {
+                var stats = callback.Value;
+                RuntimeGui.Label(
+                    $"perf {callback.Key}: avg {stats.AverageMilliseconds:0.###} ms | max {stats.MaxMilliseconds:0.###} ms | last {stats.LastMilliseconds:0.###} ms | calls {stats.Calls}");
+            }
+        }
+
         static bool ShouldLoadScript(string relativePath) => ShouldLoadScript(relativePath, _config);
 
         static bool ShouldLoadScript(string relativePath, ScriptEngineConfig config)
@@ -991,9 +1107,20 @@ public static class DemoTargetPingPatch
                 return false;
 
             if (!config.ScriptEnabled.TryGetValue(relativePath, out var enabled))
-                return config.EnableNewScripts;
+                return GetDefaultEnabledForScript(relativePath, config);
 
             return enabled;
+        }
+
+        static bool GetDefaultEnabledForScript(string relativePath, ScriptEngineConfig config)
+        {
+            return IsEvalScript(relativePath) ? config.EnableNewEvalScripts : config.EnableNewScripts;
+        }
+
+        static bool IsEvalScript(string relativePath)
+        {
+            return relativePath.StartsWith("Eval/", StringComparison.OrdinalIgnoreCase)
+                || relativePath.StartsWith("Eval\\", StringComparison.OrdinalIgnoreCase);
         }
 
         static bool TryGetRelativeScriptPath(string path, out string relativePath) =>
@@ -1218,6 +1345,31 @@ public static class DemoTargetPingPatch
                 return;
             }
 
+            LoadCompiledScript(script, log, assembly);
+        }
+
+        static void LoadCompiledScript(DiscoveredScript script, ScriptLog log, byte[] assemblyBytes)
+        {
+            Assembly assembly;
+            try
+            {
+                assembly = Assembly.Load(assemblyBytes);
+            }
+            catch (Exception ex)
+            {
+                log.Error($"Assembly load failed: {ex}");
+                SetScriptError(script.RelativePath, ex.ToString());
+                return;
+            }
+
+            LoadCompiledScript(script, log, assembly);
+        }
+
+        static void LoadCompiledScript(DiscoveredScript script, ScriptLog log, Assembly assembly)
+        {
+            var fullPath = Path.GetFullPath(script.FullPath);
+            UnloadScript(fullPath);
+
             var loader = _loaders[script.Kind];
             var loaded = loader.Load(script, assembly, log, HandleScriptRuntimeException, out var loadError);
             if (loaded == null)
@@ -1226,6 +1378,7 @@ public static class DemoTargetPingPatch
                 return;
             }
 
+            _performance[script.RelativePath] = new ScriptPerformanceTracker();
             SetScriptError(script.RelativePath, null);
             _loaded[fullPath] = loaded;
             UpdateModRecords(GetCurrentScripts());
@@ -1244,6 +1397,7 @@ public static class DemoTargetPingPatch
             finally
             {
                 _loaded.Remove(path);
+                _performance.Remove(script.RelativePath);
                 UpdateModRecords(GetCurrentScripts());
             }
         }
@@ -1275,10 +1429,80 @@ public static class DemoTargetPingPatch
     {
         public bool ScriptsEnabled = true;
         public bool EnableNewScripts = true;
+        public bool EnableNewEvalScripts = true;
         public Dictionary<string, bool> ScriptEnabled = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> ScriptErrors = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, Dictionary<string, string>> ScriptValues = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, Dictionary<string, string>> ScriptBindings = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    public sealed class CompiledScript
+    {
+        public CompiledScript(DiscoveredScript script, ScriptLog log, byte[]? assemblyBytes, string? errorText)
+        {
+            Script = script;
+            Log = log;
+            AssemblyBytes = assemblyBytes;
+            ErrorText = errorText;
+        }
+
+        public DiscoveredScript Script { get; }
+        public ScriptLog Log { get; }
+        public byte[]? AssemblyBytes { get; }
+        public string? ErrorText { get; }
+    }
+
+    sealed class ScriptPerformanceTracker
+    {
+        readonly Dictionary<string, ScriptCallbackStats> _callbacks = new(StringComparer.Ordinal);
+
+        public void Record(string callbackName, long elapsedTicks)
+        {
+            if (!_callbacks.TryGetValue(callbackName, out var stats))
+            {
+                stats = new ScriptCallbackStats();
+                _callbacks[callbackName] = stats;
+            }
+
+            stats.Record(elapsedTicks);
+        }
+
+        public ScriptPerformanceSnapshot CreateSnapshot()
+        {
+            var snapshot = new Dictionary<string, ScriptCallbackPerformance>(_callbacks.Count, StringComparer.Ordinal);
+            foreach (var pair in _callbacks)
+                snapshot[pair.Key] = pair.Value.ToSnapshot();
+
+            return new ScriptPerformanceSnapshot(snapshot);
+        }
+    }
+
+    sealed class ScriptCallbackStats
+    {
+        long _calls;
+        long _totalTicks;
+        long _maxTicks;
+        long _lastTicks;
+
+        public void Record(long elapsedTicks)
+        {
+            _calls++;
+            _totalTicks += elapsedTicks;
+            if (elapsedTicks > _maxTicks)
+                _maxTicks = elapsedTicks;
+            _lastTicks = elapsedTicks;
+        }
+
+        public ScriptCallbackPerformance ToSnapshot()
+        {
+            var totalMs = TicksToMilliseconds(_totalTicks);
+            var maxMs = TicksToMilliseconds(_maxTicks);
+            var lastMs = TicksToMilliseconds(_lastTicks);
+            var avgMs = _calls == 0 ? 0d : totalMs / _calls;
+            return new ScriptCallbackPerformance(_calls, totalMs, avgMs, maxMs, lastMs);
+        }
+
+        static double TicksToMilliseconds(long ticks) => ticks * 1000d / Stopwatch.Frequency;
     }
 
     public sealed class EmptyBindings : Dictionary<string, string>
